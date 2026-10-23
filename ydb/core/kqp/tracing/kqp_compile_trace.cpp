@@ -9,6 +9,27 @@
 
 namespace NKikimr::NKqp {
 
+TCompileTraceContinuation::TCompileTraceContinuation(NWilson::TSpan span)
+    : Id(span.GetTraceId())
+    , Span(std::move(span))
+{}
+
+NWilson::TTraceId TCompileTraceContinuation::Complete(bool success) {
+    auto guard = Guard(Lock);
+    if (!Span) {
+        return {};
+    }
+    TCompileTrace::EndSpan(Span, success);
+    return NWilson::TTraceId(Id);
+}
+
+void TCompileTraceContinuation::Cancel() {
+    auto guard = Guard(Lock);
+    if (Span) {
+        Span.EndError("Compilation stopped before continuation was ready");
+    }
+}
+
 TCompileTrace::TCompileTrace(NWilson::TTraceId root, NActors::TActorSystem* actorSystem)
     : Root(std::move(root))
     , ActorSystem(actorSystem)
@@ -70,6 +91,55 @@ TInstant TCompileTrace::Now() const {
     }
     const auto& parent = Parents.back();
     return parent.Start + CyclesToDuration(GetCycleCount() - parent.StartCycles);
+}
+
+void TCompileTrace::AwaitDependency(const NWilson::TTraceId& dependency) {
+    if (!Finished && dependency && IsEnabled(TCompileTraceLevels::Step)
+        && std::find(AwaitedDependencies.begin(), AwaitedDependencies.end(), dependency) == AwaitedDependencies.end()) {
+        AwaitedDependencies.emplace_back(dependency);
+    }
+}
+
+std::shared_ptr<TCompileTraceContinuation> TCompileTrace::StartContinuation() {
+    if (Finished || !IsEnabled(TCompileTraceLevels::Step)) {
+        return {};
+    }
+    auto span = StartSpan(TCompileTraceLevels::Step, "Compiler continuation");
+    if (!span) {
+        AwaitedDependencies.clear();
+        return {};
+    }
+    span.Attribute("ydb.compile.kind", TString("async"));
+    for (const auto& dependency : AwaitedDependencies) {
+        span.Link(dependency, {{"ydb.compile.relation", TString("depends_on")}});
+    }
+    AwaitedDependencies.clear();
+    if (Continuation) {
+        Continuation->Cancel();
+    }
+    Continuation = std::make_shared<TCompileTraceContinuation>(std::move(span));
+    return Continuation;
+}
+
+void TCompileTrace::Resume(const NWilson::TTraceId& readyFrom) {
+    if (Finished) {
+        return;
+    }
+    if (Running++ == 0 && IsEnabled(TCompileTraceLevels::Step)) {
+        // A running turn must not become the parent of phases spanning waits.
+        ExecutionSpan = NWilson::TSpan(TCompileTraceLevels::Step, NWilson::TTraceId(Root),
+            "Compiler execution", NWilson::EFlags::NONE, ActorSystem);
+        ExecutionSpan.Attribute("ydb.compile.kind", TString("execution"));
+        if (readyFrom) {
+            ExecutionSpan.Link(readyFrom, {{"ydb.compile.relation", TString("follows_from")}});
+        }
+    }
+}
+
+void TCompileTrace::Suspend() {
+    if (Running && --Running == 0) {
+        ExecutionSpan.EndOk();
+    }
 }
 
 void TCompileTrace::RecordSpan(ui8 verbosity, TString name, TInstant start) const {
@@ -136,7 +206,16 @@ void TCompileTrace::EndRegions(size_t count, bool success) {
 
 void TCompileTrace::Finish(bool success) {
     if (!std::exchange(Finished, true)) {
+        AwaitedDependencies.clear();
+        if (Continuation) {
+            Continuation->Cancel();
+            Continuation.reset();
+        }
         EndRegions(Regions.size(), success);
+        if (Running) {
+            Running = 1;
+            Suspend();
+        }
     }
 }
 
@@ -156,6 +235,20 @@ TCompileTraceScope::~TCompileTraceScope() {
     }
     Trace->Pop(Span);
     TCompileTrace::EndSpan(Span, Success && std::uncaught_exceptions() == UncaughtExceptions);
+}
+
+TCompileTraceRunScope::TCompileTraceRunScope(TCompileTrace::TPtr trace, const NWilson::TTraceId& readyFrom)
+    : Trace(std::move(trace))
+{
+    if (Trace) {
+        Trace->Resume(readyFrom);
+    }
+}
+
+TCompileTraceRunScope::~TCompileTraceRunScope() {
+    if (Trace) {
+        Trace->Suspend();
+    }
 }
 
 } // namespace NKikimr::NKqp

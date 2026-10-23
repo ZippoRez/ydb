@@ -1,6 +1,7 @@
 #include "kqp_compile_service.h"
 #include "helpers/kqp_compile_service_helpers.h"
 
+#include <ydb/core/kqp/tracing/kqp_compile_trace.h>
 #include <ydb/core/kqp/tracing/kqp_query_rendering.h>
 #include <ydb/core/actorlib_impl/long_timer.h>
 #include <ydb/core/base/appdata.h>
@@ -715,6 +716,10 @@ private:
         auto compileRequest = RequestsQueue.FinishActiveRequest(*compileResult->Query);
         Y_ABORT_UNLESS(compileRequest.CompileActor == compileActorId);
         Y_ABORT_UNLESS(compileRequest.Uid == compileResult->Uid);
+        if (ev->TraceId) {
+            compileRequest.CompileServiceSpan.Event("Compilation reply received");
+            compileRequest.CompileServiceSpan.Link(ev->TraceId, {{"ydb.compile.relation", TString("reply")}});
+        }
 
         YDB_LOG_DEBUG_CTX(ctx, "Received response",
             {"sender", compileRequest.Sender},
@@ -980,6 +985,10 @@ private:
     }
 
     void StartCompilation(TKqpCompileRequest&& request, const TActorContext& ctx) {
+        if (request.CompileSettings.Action == ECompileActorAction::COMPILE && request.CompileServiceSpan
+            && request.CompileServiceSpan.GetTraceId().GetVerbosity() >= TCompileTraceLevels::Step) {
+            request.CompileServiceSpan.Event("Compilation dispatched");
+        }
         auto compileActor = CreateKqpCompileActor(ctx.SelfID, KqpSettings, TableServiceConfig, QueryServiceConfig, ModuleResolverState, Counters,
             request.Uid, request.Query, request.UserToken, request.ClientAddress, FederatedQuerySetup, request.DbCounters, request.GUCSettings, request.ApplicationName, request.UserRequestContext,
             request.CompileServiceSpan.GetTraceId(), request.TempTablesState, request.CompileSettings.Action, std::move(request.QueryAst), request.CollectDiagnostics,

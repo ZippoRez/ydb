@@ -233,18 +233,24 @@ public:
             if (trace && !dependencyJoin) {
                 dependencyJoin = trace->StartSpan(NKikimr::NKqp::TCompileTraceLevels::Step,
                     "Await table metadata");
+                dependencyJoin.Attribute("ydb.compile.kind", TString("async"));
+                dependencyJoin.Attribute("ydb.compile.join", TString("all_or_error"));
             }
+            auto dependency = dependencyJoin.CreateChild(NKikimr::NKqp::TCompileTraceLevels::Step,
+                "Resolve table metadata");
+            dependency.Attribute("ydb.compile.kind", TString("async"));
             if (dependencyJoin) {
                 dependencyResults.push_back(result);
+                dependencyJoin.Link(dependency.GetTraceId(), {{"ydb.compile.relation", TString("depends_on")}});
             }
-            // The metadata requests of the gateway are parented by the wait.
+            // The complete table future can include multiple gateway requests.
             auto future = [&] {
                 if (trace) {
-                    trace->Push(dependencyJoin);
+                    trace->Push(dependency);
                 }
                 Y_DEFER {
                     if (trace) {
-                        trace->Pop(dependencyJoin);
+                        trace->Pop(dependency);
                     }
                 };
                 return Gateway->LoadTableMetadata(clusterName, tableName,
@@ -259,6 +265,8 @@ public:
                                 .WithTopicsIo(SessionCtx->Config().FeatureFlags.GetEnableTopicsSqlIoOperations())
                 );
             }();
+            future = NKikimr::NKqp::TraceCompileDependency(std::move(future), std::move(dependency),
+                [](const IKikimrGateway::TTableMetadataResult& value) { return value.Success(); });
 
             futures.push_back(future.Apply([result, queryType]
                 (const NThreading::TFuture<IKikimrGateway::TTableMetadataResult>& future) {
@@ -289,6 +297,7 @@ public:
 
         // A missing table is a valid outcome, e.g. for CREATE TABLE: whether the
         // query needs the table is checked later.
+        MetadataDependency = dependencyJoin.GetTraceId();
         AsyncFuture = NKikimr::NKqp::TraceCompileDependency(
             NThreading::WaitExceptionOrAll(futures), std::move(dependencyJoin),
             [results = std::move(dependencyResults)] {
@@ -301,6 +310,9 @@ public:
 
     NThreading::TFuture<void> DoGetAsyncFuture(const TExprNode& input) final {
         Y_UNUSED(input);
+        if (auto* trace = SessionCtx->QueryPtr()->CompileTrace.Get()) {
+            trace->AwaitDependency(MetadataDependency);
+        }
         return AsyncFuture;
     }
 
@@ -458,6 +470,7 @@ public:
     void Rewind() final {
         LoadResults.clear();
         AsyncFuture = {};
+        MetadataDependency = {};
     }
 
 private:
@@ -469,6 +482,7 @@ private:
 
     THashMap<std::pair<TString, TString>, std::shared_ptr<IKikimrGateway::TTableMetadataResult>> LoadResults;
     NThreading::TFuture<void> AsyncFuture;
+    NWilson::TTraceId MetadataDependency;
 };
 
 class TKikimrConfigurationTransformer : public NCommon::TProviderConfigurationTransformer {

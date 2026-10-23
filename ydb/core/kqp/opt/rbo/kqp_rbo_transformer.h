@@ -105,6 +105,7 @@ private:
     NActors::TActorSystem* ActorSystem;
     std::shared_ptr<TColumnStatisticsSharedState> SharedState;
     NThreading::TFuture<void> ColumnStatisticsReadiness;
+    NWilson::TTraceId ColumnStatisticsDependency;
     NWilson::TSpan ColumnStatisticsSpan;
     // Issues of all statistics responses, only collected when tracing.
     std::shared_ptr<NYql::TIssues> ColumnStatisticsIssues;

@@ -222,6 +222,9 @@ IGraphTransformer::TStatus TKqpNewRBOTransformer::DoTransform(TExprNode::TPtr in
 
 NThreading::TFuture<void> TKqpNewRBOTransformer::DoGetAsyncFuture(const TExprNode& input) {
     Y_UNUSED(input);
+    if (auto* trace = KqpCtx.GetCompileTrace()) {
+        trace->AwaitDependency(ColumnStatisticsDependency);
+    }
     return ColumnStatisticsReadiness;
 }
 
@@ -411,6 +414,9 @@ IGraphTransformer::TStatus TKqpNewRBOTransformer::RequestColumnStatistics(TExprC
     }
     CollectTablesAndColumnsNames(ctx);
     auto dependencyJoin = ColumnStatisticsSpan.CreateChild(TCompileTraceLevels::Step, "Await column statistics");
+    dependencyJoin.Attribute("ydb.compile.kind", TString("async"));
+    dependencyJoin.Attribute("ydb.compile.join", TString("all"));
+    ColumnStatisticsDependency = dependencyJoin.GetTraceId();
 
     TVector<NThreading::TFuture<TColumnStatisticsResponse>> futures;
     AddStatRequest(ActorSystem, futures, Tables, Cluster, Database, TypeCtx, NStat::EStatType::COUNT_MIN_SKETCH, CMColumnsByTableName,

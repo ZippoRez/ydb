@@ -812,6 +812,36 @@ Y_UNIT_TEST_SUITE(TKqpQueryTrace) {
         const auto& cleanup = *FindSpan(snapshot, "Cleanup compiler");
         const auto* compile = FindParent(snapshot, cleanup);
         UNIT_ASSERT(compile && compile->name() == "Compile query");
+        UNIT_ASSERT(FindAttribute(cleanup, "ydb.compile.cleanup")->value().bool_value());
+        const auto* plan = FindParent(snapshot, *compile);
+        UNIT_ASSERT(plan && plan->name() == "Get query plan");
+        auto eventTime = [](const auto& span, TStringBuf name) -> ui64 {
+            for (const auto& event : span.events()) {
+                if (event.name() == name) {
+                    return event.time_unix_nano();
+                }
+            }
+            UNIT_FAIL("Missing handoff event " << name);
+            return 0;
+        };
+        UNIT_ASSERT_LE(eventTime(*plan, "Compilation dispatched"),
+            eventTime(*compile, "Compilation started") + 1'000'000);
+        UNIT_ASSERT_LE(eventTime(*compile, "Compilation reply dispatched"),
+            eventTime(*plan, "Compilation reply received") + 1'000'000);
+        UNIT_ASSERT_LE(eventTime(*compile, "Compilation reply dispatched"), cleanup.start_time_unix_nano() + 1'000'000);
+        UNIT_ASSERT(std::ranges::any_of(compile->links(), [&](const auto& link) {
+            return link.span_id() == plan->span_id()
+                && FindAttribute(link, "ydb.compile.relation")->value().string_value() == "dispatch";
+        }));
+        UNIT_ASSERT(std::ranges::any_of(plan->links(), [&](const auto& link) {
+            return link.span_id() == compile->span_id()
+                && FindAttribute(link, "ydb.compile.relation")->value().string_value() == "reply";
+        }));
+        const auto* metadataWait = FindSpan(snapshot, "Await table metadata");
+        UNIT_ASSERT(metadataWait && metadataWait->links_size());
+        UNIT_ASSERT_VALUES_EQUAL(FindAttribute(*metadataWait, "ydb.compile.join")->value().string_value(), "all_or_error");
+        UNIT_ASSERT(FindSpan(snapshot, "Compiler execution"));
+        UNIT_ASSERT(FindSpan(snapshot, "Compiler continuation"));
         AssertDescendant(snapshot, "Load metadata", "Await table metadata");
         AssertDescendant(snapshot, "Await table metadata", "IO annotation");
         // Wilson derives end times from each span's cycle clock; allow their

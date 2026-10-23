@@ -26,6 +26,22 @@ struct TCompileTraceLevels {
     };
 };
 
+// A future can complete after its compiler has been cancelled. Only this span
+// is shared with its callback; compiler state stays on the actor's thread.
+class TCompileTraceContinuation {
+public:
+    explicit TCompileTraceContinuation(NWilson::TSpan span);
+    NWilson::TTraceId Complete(bool success = true);
+
+private:
+    friend class TCompileTrace;
+    void Cancel();
+
+    const NWilson::TTraceId Id;
+    TAdaptiveLock Lock;
+    NWilson::TSpan Span;
+};
+
 // Spans of a single query compilation. Compiler turns run serially but may
 // migrate between worker threads. Logical phases may stay open across waits;
 // scope spans record synchronous work. The innermost open logical phase or
@@ -53,9 +69,18 @@ public:
     NWilson::TTraceId GetCurrentParent() const;
 
     // Time on the clock of the innermost span. Wilson ends a span at its start
-    // time plus the CPU cycles elapsed since, so spans recorded with these times
+    // time plus elapsed cycle-counter time, so spans recorded with these times
     // nest within it.
     TInstant Now() const;
+
+    // Register only futures actually returned by GetAsyncFuture to the pipeline.
+    void AwaitDependency(const NWilson::TTraceId& dependency);
+    std::shared_ptr<TCompileTraceContinuation> StartContinuation();
+
+    // Elapsed wall-clock intervals of compiler turns, including preemption.
+    // These are not CPU measurements or physical worker tracks.
+    void Resume(const NWilson::TTraceId& readyFrom = {});
+    void Suspend();
 
     // Records a span that has already finished under the current parent, e.g.
     // for an operation that is traced only if it turns out to matter. Spans
@@ -95,6 +120,10 @@ private:
         NWilson::TSpan Span;
     };
     TVector<TRegion> Regions;
+    TVector<NWilson::TTraceId> AwaitedDependencies;
+    std::shared_ptr<TCompileTraceContinuation> Continuation;
+    NWilson::TSpan ExecutionSpan;
+    ui32 Running = 0;
     bool Finished = false;
 };
 
@@ -119,6 +148,7 @@ NThreading::TFuture<T> TraceCompileDependencyWith(NThreading::TFuture<T> future,
         try {
             ready.TryRethrow();
         } catch (...) {
+            span->Attribute("ydb.compile.future_outcome", TString("exception"));
             if constexpr (std::is_void_v<T>) {
                 end(*span, false);
             } else {
@@ -126,6 +156,7 @@ NThreading::TFuture<T> TraceCompileDependencyWith(NThreading::TFuture<T> future,
             }
             throw;
         }
+        span->Attribute("ydb.compile.future_outcome", TString("value"));
         if constexpr (std::is_void_v<T>) {
             end(*span, true);
         } else {
@@ -173,6 +204,19 @@ private:
     const int UncaughtExceptions;
     NWilson::TSpan Span;
     bool Success = true;
+};
+
+class TCompileTraceRunScope {
+public:
+    explicit TCompileTraceRunScope(TCompileTrace::TPtr trace, const NWilson::TTraceId& readyFrom = {});
+    ~TCompileTraceRunScope();
+
+    TCompileTraceRunScope(const TCompileTraceRunScope&) = delete;
+    TCompileTraceRunScope& operator=(const TCompileTraceRunScope&) = delete;
+
+private:
+    // Completion/fallback may replace the actor's trace before this scope ends.
+    const TCompileTrace::TPtr Trace;
 };
 
 } // namespace NKikimr::NKqp
