@@ -137,7 +137,6 @@ void TRuleBasedStage::RunStage(TOpRoot& root, TRBOContext& ctx) {
     bool needToLog = NYql::NLog::YqlLogger().NeedToLog(NYql::NLog::EComponent::CoreDq, NYql::NLog::ELevel::TRACE);
     ui32 computedProps = 0;
     auto* trace = ctx.GetCompileTrace();
-    const bool traceRules = trace && trace->IsEnabled(TCompileTraceLevels::Detail);
 
     while (fired && numMatches < maxNumOfMatches) {
         fired = false;
@@ -162,14 +161,14 @@ void TRuleBasedStage::RunStage(TOpRoot& root, TRBOContext& ctx) {
                 auto& op = parent ? parent->MutableChild(childIndex)
                     : subplanIU ? root.PlanProps.Subplans.MutablePlan(*subplanIU)
                     : root.MutableChild(0);
-                const TInstant ruleStart = traceRules ? trace->Now() : TInstant::Zero();
-                const bool ruleApplied = rule->MatchAndApply(op, ctx, root.PlanProps);
+                bool ruleApplied;
+                {
+                    TCompileTraceRuleScope ruleScope(trace, rule->RuleName);
+                    ruleApplied = rule->MatchAndApply(op, ctx, root.PlanProps);
+                    ruleScope.SetApplied(ruleApplied);
+                }
                 Y_ENSURE(op, "Rule left a null plan edge");
                 traceAttempt.CloseRule();
-                // Only applied rules get a span, recorded once the outcome is known.
-                if (traceRules && ruleApplied) {
-                    trace->RecordSpan(TCompileTraceLevels::Detail, "Rule: " + rule->RuleName, ruleStart);
-                }
 
                 if (!ruleApplied) {
                     traceAttempt.SubmitIfHasInfo(root, StageName);

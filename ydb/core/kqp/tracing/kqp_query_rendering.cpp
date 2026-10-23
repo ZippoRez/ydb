@@ -54,7 +54,7 @@ NWilson::TSpan MakeMetadataTraceSpan(const NWilson::TTraceId& parent, NActors::T
     const bool loadsMetadata = operation == EMetadataTraceOperation::LoadMetadata;
     const TString name = loadsMetadata ? "Load metadata" : "Load statistics";
     NWilson::TSpan span(TComponentTracingLevels::TQueryProcessor::Detailed,
-        NWilson::TTraceId(parent), name, NWilson::EFlags::NONE, actorSystem);
+        NWilson::TTraceId(parent), name, NWilson::EFlags::WALL_CLOCK, actorSystem);
     span.Attribute("db.collection.name", table);
     span.Attribute("ydb.actor.type", TString("TActorRequestHandler"));
     span.Attribute("ydb.code.component", TString("KqpTableMetadataLoader"));

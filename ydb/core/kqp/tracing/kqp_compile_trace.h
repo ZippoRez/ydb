@@ -68,11 +68,6 @@ public:
     // e.g. metadata requests of the gateway. Safe to call from any thread.
     NWilson::TTraceId GetCurrentParent() const;
 
-    // Time on the clock of the innermost span. Wilson ends a span at its start
-    // time plus elapsed cycle-counter time, so spans recorded with these times
-    // nest within it.
-    TInstant Now() const;
-
     // Register only futures actually returned by GetAsyncFuture to the pipeline.
     void AwaitDependency(const NWilson::TTraceId& dependency);
     std::shared_ptr<TCompileTraceContinuation> StartContinuation();
@@ -81,11 +76,6 @@ public:
     // These are not CPU measurements or physical worker tracks.
     void Resume(const NWilson::TTraceId& readyFrom = {});
     void Suspend();
-
-    // Records a span that has already finished under the current parent, e.g.
-    // for an operation that is traced only if it turns out to matter. Spans
-    // started during the operation are not parented by it.
-    void RecordSpan(ui8 verbosity, TString name, TInstant start) const;
 
     // A region is a span opened and closed by separate calls, e.g. by marker
     // stages placed around groups of transformers of a pipeline. Regions of one
@@ -99,6 +89,9 @@ public:
     void Finish(bool success);
 
 private:
+    friend class TCompileTraceRuleScope;
+    void Push(const NWilson::TTraceId& id);
+    bool Pop(const NWilson::TTraceId& id);
     void EndRegions(size_t count, bool success);
 
 private:
@@ -107,8 +100,7 @@ private:
 
     struct TParent {
         NWilson::TTraceId Id;
-        TInstant Start;
-        ui64 StartCycles;
+        mutable bool HasChildren = false;
     };
     TVector<TParent> Parents;
     // Guards Parents for GetCurrentParent.
@@ -217,6 +209,29 @@ public:
 private:
     // Completion/fallback may replace the actor's trace before this scope ends.
     const TCompileTrace::TPtr Trace;
+};
+
+// Reserve the parent before applying a rule, but emit only applied rules,
+// failed rules, or rules whose children need a parent. Unproductive leaf
+// attempts do not create exported spans.
+class TCompileTraceRuleScope {
+public:
+    TCompileTraceRuleScope(TCompileTrace* trace, const TString& name);
+    ~TCompileTraceRuleScope();
+
+    TCompileTraceRuleScope(const TCompileTraceRuleScope&) = delete;
+    TCompileTraceRuleScope& operator=(const TCompileTraceRuleScope&) = delete;
+
+    void SetApplied(bool applied) { Applied = applied; }
+
+private:
+    TCompileTrace* const Trace;
+    const TString Name;
+    const int UncaughtExceptions;
+    NWilson::TTraceId Parent;
+    NWilson::TTraceId Id;
+    TInstant Start;
+    bool Applied = false;
 };
 
 } // namespace NKikimr::NKqp

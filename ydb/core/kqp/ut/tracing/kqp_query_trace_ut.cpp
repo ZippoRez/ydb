@@ -805,7 +805,15 @@ Y_UNIT_TEST_SUITE(TKqpQueryTrace) {
             AssertStatus(snapshot, name, NTraceProto::Status::STATUS_CODE_OK);
         }
         for (const TStringBuf name : {"Prepare CBO join tree", "CBO join search", "Rebuild CBO plan"}) {
-            AssertDescendant(snapshot, name, "RBO stage: Invoke CBO");
+            AssertDescendant(snapshot, name, "Rule: Optimize CBO tree");
+            for (const auto& child : snapshot.Spans) {
+                if (child.name() == name) {
+                    const auto* parent = FindParent(snapshot, child);
+                    UNIT_ASSERT(parent && parent->name() == "Rule: Optimize CBO tree");
+                    UNIT_ASSERT_LE(parent->start_time_unix_nano(), child.start_time_unix_nano());
+                    UNIT_ASSERT_LE(child.end_time_unix_nano(), parent->end_time_unix_nano());
+                }
+            }
         }
         AssertDescendant(snapshot, "Rule: Optimize CBO tree", "RBO stage: Invoke CBO");
         AssertDescendant(snapshot, "Cleanup compiler", "Compile query");

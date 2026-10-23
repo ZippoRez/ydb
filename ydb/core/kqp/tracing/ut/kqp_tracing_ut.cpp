@@ -13,6 +13,9 @@
 #include <ydb/library/yql/dq/actors/protos/dq_events.pb.h>
 #include <ydb/library/yql/dq/proto/dq_tasks.pb.h>
 
+#include <util/generic/scope.h>
+
+#include <chrono>
 #include <thread>
 #include <stdexcept>
 
@@ -183,38 +186,86 @@ Y_UNIT_TEST_SUITE(TKqpTrace) {
         }
     }
 
-    Y_UNIT_TEST(RecordedSpanNestsUnderCurrentParent) {
-        class TProducer : public NActors::TActorBootstrapped<TProducer> {
-        public:
-            void Bootstrap(const NActors::TActorContext& ctx) {
-                NWilson::TSpan root(15, NWilson::TTraceId::NewTraceId(15, 4095), "Query");
-                NKqp::TCompileTrace trace(root.GetTraceId(), ctx.ActorSystem());
-                {
-                    NKqp::TCompileTraceScope stage(&trace, 15, "Stage");
-                    const auto start = trace.Now();
-                    {
-                        // Not parented by the recorded span: it does not exist yet.
-                        NKqp::TCompileTraceScope child(&trace, 15, "CBO work");
-                    }
-                    trace.RecordSpan(15, "Applied rule", start);
-                    trace.RecordSpan(16, "Too verbose", start);
-                }
-                root.EndOk();
-                PassAway();
-            }
-        };
+    Y_UNIT_TEST(RuleScopesPreserveParentsWithoutExportingEmptyAttempts) {
         NActors::TTestActorRuntimeBase runtime;
         runtime.Initialize();
         auto* uploader = RegisterUploader(runtime);
-        runtime.Register(new TProducer());
+        NWilson::TSpan root(15, NWilson::TTraceId::NewTraceId(15, 4095), "Query",
+            NWilson::EFlags::WALL_CLOCK, runtime.GetActorSystem(0));
+        NKqp::TCompileTrace trace(root.GetTraceId(), runtime.GetActorSystem(0));
+        {
+            NKqp::TCompileTraceScope stage(&trace, 15, "Stage");
+            {
+                NKqp::TCompileTraceRuleScope rule(&trace, "Applied");
+                NKqp::TCompileTraceScope child(&trace, 15, "CBO work");
+                rule.SetApplied(true);
+            }
+            {
+                NKqp::TCompileTraceRuleScope rule(&trace, "Empty attempt");
+            }
+            {
+                NKqp::TCompileTraceRuleScope rule(&trace, "Unapplied with work");
+                NKqp::TCompileTraceScope child(&trace, 15, "Unapplied child");
+            }
+            try {
+                NKqp::TCompileTraceRuleScope rule(&trace, "Throwing");
+                throw std::runtime_error("expected");
+            } catch (const std::runtime_error&) {
+            }
+        }
+        root.EndOk();
         runtime.SimulateSleep(TDuration::MilliSeconds(1));
-        AssertDescendant(*uploader, "Applied rule", "Stage");
-        AssertDescendant(*uploader, "CBO work", "Stage");
-        AssertStatus(*uploader, "Applied rule", NTraceProto::Status::STATUS_CODE_OK);
-        UNIT_ASSERT(!FindSpan(*uploader, "Too verbose"));
-        const auto& rule = *FindSpan(*uploader, "Applied rule");
-        UNIT_ASSERT_LE(FindSpan(*uploader, "CBO work")->end_time_unix_nano(), rule.end_time_unix_nano() + 1000);
+        AssertDescendant(*uploader, "CBO work", "Rule: Applied");
+        AssertDescendant(*uploader, "Rule: Applied", "Stage");
+        AssertDescendant(*uploader, "Unapplied child", "Rule: Unapplied with work");
+        AssertStatus(*uploader, "Rule: Throwing", NTraceProto::Status::STATUS_CODE_ERROR);
+        UNIT_ASSERT(!FindSpan(*uploader, "Rule: Empty attempt"));
+        UNIT_ASSERT(!FindAttribute(*FindSpan(*uploader, "Rule: Unapplied with work"),
+            "ydb.compile.rule_applied")->value().bool_value());
+        const auto& rule = *FindSpan(*uploader, "Rule: Applied");
+        const auto& child = *FindSpan(*uploader, "CBO work");
+        UNIT_ASSERT_LE(rule.start_time_unix_nano(), child.start_time_unix_nano());
+        UNIT_ASSERT_LE(child.end_time_unix_nano(), rule.end_time_unix_nano());
         UNIT_ASSERT(uploader->BuildTraceTrees());
+    }
+
+    Y_UNIT_TEST(WallClockBoundariesDoNotDependOnCycleCalibration) {
+        NActors::TTestActorRuntimeBase runtime;
+        runtime.Initialize();
+        auto* uploader = RegisterUploader(runtime);
+        NWilson::TSpan root(15, NWilson::TTraceId::NewTraceId(15, 4095), "Query",
+            NWilson::EFlags::WALL_CLOCK, runtime.GetActorSystem(0));
+        NKqp::TCompileTrace trace(root.GetTraceId(), runtime.GetActorSystem(0));
+        ui64 eventBefore, eventAfter, endBefore, endAfter;
+        {
+            // Amplify the clock mismatch deterministically, without long sleeps.
+            const ui64 cyclesPerSecond = GetCyclesPerMillisecond() * 1000;
+            SetCyclesPerSecond(cyclesPerSecond / 2);
+            Y_DEFER { SetCyclesPerSecond(0); };
+            {
+                NKqp::TCompileTraceScope first(&trace, 15, "First synchronous step");
+                auto child = root.CreateChild(15, "Inherited wall clock");
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                eventBefore = TInstant::Now().NanoSeconds();
+                child.Event("Ready");
+                eventAfter = TInstant::Now().NanoSeconds();
+                endBefore = TInstant::Now().NanoSeconds();
+                child.EndOk();
+                endAfter = TInstant::Now().NanoSeconds();
+            }
+            NKqp::TCompileTraceScope next(&trace, 15, "Next synchronous step");
+        }
+        root.EndOk();
+        runtime.SimulateSleep(TDuration::MilliSeconds(1));
+        const auto& first = *FindSpan(*uploader, "First synchronous step");
+        const auto& next = *FindSpan(*uploader, "Next synchronous step");
+        const auto& child = *FindSpan(*uploader, "Inherited wall clock");
+        UNIT_ASSERT_LE(first.end_time_unix_nano(), next.start_time_unix_nano());
+        UNIT_ASSERT_VALUES_EQUAL(child.events_size(), 1);
+        UNIT_ASSERT_LE(eventBefore, child.events(0).time_unix_nano());
+        UNIT_ASSERT_LE(child.events(0).time_unix_nano(), eventAfter);
+        UNIT_ASSERT_LE(endBefore, child.end_time_unix_nano());
+        UNIT_ASSERT_LE(child.end_time_unix_nano(), endAfter);
     }
 
     Y_UNIT_TEST(RestartReopensRegionsAndEndsNestedOnes) {

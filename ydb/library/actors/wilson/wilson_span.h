@@ -42,6 +42,7 @@ namespace NWilson {
         NONE = 0,
         AUTO_END = 1,
         ACTION_ON_END = 2,  // for retro-spans, to avoid unneeded virtual method calls
+        WALL_CLOCK = 4, // sample the same wall clock for starts, events and ends
     };
 
     Y_DECLARE_FLAGS(TFlags, EFlags);
@@ -83,7 +84,7 @@ namespace NWilson {
 
         static TSpan ConstructTerminated(const TTraceId& parentId, const TTraceId& spanId,
                 TInstant startTs, TInstant endTs, NTraceProto::Status::StatusCode statusCode,
-                const TString& name);
+                const TString& name, NActors::TActorSystem* actorSystem = nullptr);
 
         explicit operator bool() const {
             return Data && !Data->Sent && !Data->Ignored;
@@ -197,6 +198,9 @@ namespace NWilson {
         }
 
         TSpan CreateChild(ui8 verbosity, std::variant<std::optional<TString>, const char*> name, TFlags flags = EFlags::NONE) const {
+            if (Data) {
+                flags |= Data->Flags & EFlags::WALL_CLOCK;
+            }
             return TSpan(verbosity, GetTraceId(), std::move(name), flags, GetActorSystem());
         }
 
@@ -210,6 +214,9 @@ namespace NWilson {
         void Send();
 
         ui64 TimeUnixNano() const {
+            if (Data->Flags & EFlags::WALL_CLOCK) {
+                return TInstant::Now().NanoSeconds();
+            }
             const TInstant now = Data->StartTime + CyclesToDuration(GetCycleCount() - Data->StartCycles);
             return now.NanoSeconds();
         }

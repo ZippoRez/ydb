@@ -93,7 +93,7 @@ public:
         , SplitExpr(std::move(splitExpr))
         , UserRequestContext(userRequestContext)
         , CompileParentTraceId(traceId)
-        , CompileActorSpan(TWilsonKqp::CompileActor, std::move(traceId), "Compile query")
+        , CompileActorSpan(TWilsonKqp::CompileActor, std::move(traceId), "Compile query", NWilson::EFlags::WALL_CLOCK)
         , TempTablesState(std::move(tempTablesState))
         , CollectFullDiagnostics(collectFullDiagnostics)
         , CompileAction(compileAction)

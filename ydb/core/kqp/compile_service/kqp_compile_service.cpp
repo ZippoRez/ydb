@@ -536,7 +536,7 @@ private:
         YDB_LOG_DEBUG_CTX(ctx, "Performing compile request",
             {"spanIdPtr", ev->TraceId.GetSpanIdPtr()});
 
-        NWilson::TSpan compileServiceSpan(TWilsonKqp::CompileService, std::move(ev->TraceId), "Get query plan");
+        NWilson::TSpan compileServiceSpan(TWilsonKqp::CompileService, std::move(ev->TraceId), "Get query plan", NWilson::EFlags::WALL_CLOCK);
 
         YDB_LOG_DEBUG_CTX(ctx, "Received compile request",
             {"sender", ev->Sender},
@@ -655,7 +655,7 @@ private:
         if (compileResult || request.Query) {
             Counters->ReportCompileRequestCompile(dbCounters);
 
-            NWilson::TSpan compileServiceSpan(TWilsonKqp::CompileService, ev->Get() ? std::move(ev->TraceId) : NWilson::TTraceId(), "Get query plan");
+            NWilson::TSpan compileServiceSpan(TWilsonKqp::CompileService, ev->Get() ? std::move(ev->TraceId) : NWilson::TTraceId(), "Get query plan", NWilson::EFlags::WALL_CLOCK);
 
             TKqpCompileSettings compileSettings(
                 true,
@@ -698,7 +698,7 @@ private:
 
             NYql::TIssue issue(NYql::TPosition(), TStringBuilder() << "Query not found: " << request.Uid);
 
-            NWilson::TSpan compileServiceSpan(TWilsonKqp::CompileService, ev->Get() ? std::move(ev->TraceId) : NWilson::TTraceId(), "Get query plan");
+            NWilson::TSpan compileServiceSpan(TWilsonKqp::CompileService, ev->Get() ? std::move(ev->TraceId) : NWilson::TTraceId(), "Get query plan", NWilson::EFlags::WALL_CLOCK);
 
             ReplyError(ev->Sender, request.Uid, Ydb::StatusIds::NOT_FOUND, {issue}, ctx,
                 ev->Cookie, std::move(ev->Get()->Orbit), std::move(compileServiceSpan));

@@ -148,10 +148,11 @@ namespace NWilson {
     }
 
     TSpan TSpan::ConstructTerminated(const NWilson::TTraceId& parentId, const NWilson::TTraceId& spanId,
-            TInstant startTs, TInstant endTs, NTraceProto::Status::StatusCode statusCode, const TString& name) {
+            TInstant startTs, TInstant endTs, NTraceProto::Status::StatusCode statusCode, const TString& name,
+            NActors::TActorSystem* actorSystem) {
         TSpan res;
         res.Data = std::make_unique<TData>(TInstant::Zero(), 0, NWilson::TTraceId(spanId), EFlags::NONE,
-                nullptr);
+                actorSystem);
         res.Data->Span.set_trace_id(parentId.GetTraceIdPtr(), parentId.GetTraceIdSize());
         res.Data->Span.set_parent_span_id(parentId.GetSpanIdPtr(), parentId.GetSpanIdSize());
         res.Data->Span.set_span_id(spanId.GetSpanIdPtr(), spanId.GetSpanIdSize());
