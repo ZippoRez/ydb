@@ -17,11 +17,11 @@ public:
     {}
 
     TStatus DoTransform(TExprNode::TPtr input, TExprNode::TPtr& output, TExprContext& ctx) final {
-        auto* trace = QueryCtx->CompileTrace.Get();
-        if (!Span && trace) {
-            Span = trace->StartSpan(Verbosity, Name);
+        if (auto* trace = QueryCtx->CompileTrace.Get()) {
+            // Does nothing if the region is still open, e.g. after Repeat.
+            trace->BeginRegion(Verbosity, Name, this);
         }
-        return Traced(trace, [&] {
+        return Traced([&] {
             return Transformer->Transform(input, output, ctx);
         });
     }
@@ -31,15 +31,13 @@ public:
     }
 
     TStatus DoApplyAsyncChanges(TExprNode::TPtr input, TExprNode::TPtr& output, TExprContext& ctx) final {
-        return Traced(QueryCtx->CompileTrace.Get(), [&] {
+        return Traced([&] {
             return Transformer->ApplyAsyncChanges(input, output, ctx);
         });
     }
 
     void Rewind() final {
-        if (Span) {
-            Span.EndError("Transformer rewound");
-        }
+        EndRegion(false);
         Transformer->Rewind();
     }
 
@@ -49,26 +47,26 @@ public:
 
 private:
     template <class TFunc>
-    TStatus Traced(TCompileTrace* trace, TFunc&& func) {
-        if (!trace) {
-            return func();
-        }
-        trace->Push(Span);
+    TStatus Traced(TFunc&& func) {
         TStatus status = TStatus::Error;
         try {
             status = func();
         } catch (...) {
-            trace->Pop(Span);
-            TCompileTrace::EndSpan(Span, false);
+            EndRegion(false);
             throw;
         }
-        trace->Pop(Span);
         if (status == TStatus::Ok || status.HasRestart) {
-            TCompileTrace::EndSpan(Span);
+            EndRegion(true);
         } else if (status == TStatus::Error) {
-            TCompileTrace::EndSpan(Span, false);
+            EndRegion(false);
         }
         return status;
+    }
+
+    void EndRegion(bool success) {
+        if (auto* trace = QueryCtx->CompileTrace.Get()) {
+            trace->EndRegion(Name, this, success);
+        }
     }
 
 private:
@@ -76,7 +74,6 @@ private:
     const TIntrusivePtr<TKikimrQueryContext> QueryCtx;
     const ui8 Verbosity;
     const TString Name;
-    NWilson::TSpan Span;
 };
 
 class TCompileTraceMarker : public TSyncTransformerBase {
@@ -96,7 +93,7 @@ public:
             if (Begin) {
                 trace->BeginRegion(Verbosity, Name, Group);
             } else {
-                trace->EndRegion(Name);
+                trace->EndRegion(Name, Group);
             }
         }
         return TStatus::Ok;
@@ -125,8 +122,9 @@ TAutoPtr<IGraphTransformer> CreateCompileTraceBegin(TIntrusivePtr<TKikimrQueryCo
     return new TCompileTraceMarker(std::move(queryCtx), true, verbosity, std::move(name), group);
 }
 
-TAutoPtr<IGraphTransformer> CreateCompileTraceEnd(TIntrusivePtr<TKikimrQueryContext> queryCtx, TString name) {
-    return new TCompileTraceMarker(std::move(queryCtx), false, 0, std::move(name), nullptr);
+TAutoPtr<IGraphTransformer> CreateCompileTraceEnd(TIntrusivePtr<TKikimrQueryContext> queryCtx, TString name,
+        const void* group) {
+    return new TCompileTraceMarker(std::move(queryCtx), false, 0, std::move(name), group);
 }
 
 } // namespace NKikimr::NKqp

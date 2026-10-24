@@ -1,5 +1,7 @@
 #pragma once
 
+#include "kqp_trace_flow.h"
+
 #include <ydb/library/actors/wilson/wilson_span.h>
 #include <ydb/library/wilson_ids/wilson.h>
 #include <library/cpp/threading/future/future.h>
@@ -26,26 +28,13 @@ struct TCompileTraceLevels {
     };
 };
 
-// A future can complete after its compiler has been cancelled. Only this span
-// is shared with its callback; compiler state stays on the actor's thread.
-class TCompileTraceContinuation {
-public:
-    explicit TCompileTraceContinuation(NWilson::TSpan span);
-    NWilson::TTraceId Complete(bool success = true);
-
-private:
-    friend class TCompileTrace;
-    void Cancel();
-
-    const NWilson::TTraceId Id;
-    TAdaptiveLock Lock;
-    NWilson::TSpan Span;
-};
-
-// Spans of a single query compilation. Compiler turns run serially but may
-// migrate between worker threads. Logical phases may stay open across waits;
-// scope spans record synchronous work. The innermost open logical phase or
-// scope parents new compiler work.
+// Spans of a single query compilation, all in the flow of the compiler. Regions
+// may stay open across asynchronous waits; scope spans record synchronous work.
+// The innermost open region or scope parents new compiler work.
+//
+// Threading: compiler turns run serially, possibly on different threads. Only
+// GetCurrentParent may be called concurrently with them; everything else must be
+// called from the compiler turns.
 class TCompileTrace : public TThrRefBase {
 public:
     using TPtr = TIntrusivePtr<TCompileTrace>;
@@ -66,26 +55,20 @@ public:
 
     // Parent for spans that other components start during the compilation,
     // e.g. metadata requests of the gateway. Safe to call from any thread.
+    // Marks the parent as having children, so that a rule scope that starts
+    // them is emitted.
     NWilson::TTraceId GetCurrentParent() const;
-
-    // Register only futures actually returned by GetAsyncFuture to the pipeline.
-    void AwaitDependency(const NWilson::TTraceId& dependency);
-    std::shared_ptr<TCompileTraceContinuation> StartContinuation();
-
-    // Elapsed wall-clock intervals of compiler turns, including preemption.
-    // These are not CPU measurements or physical worker tracks.
-    void Resume(const NWilson::TTraceId& readyFrom = {});
-    void Suspend();
 
     // A region is a span opened and closed by separate calls, e.g. by marker
     // stages placed around groups of transformers of a pipeline. Regions of one
     // group follow each other: opening a region ends the open regions of its
     // group, unless it is open itself (after a restart of the pipeline).
     void BeginRegion(ui8 verbosity, const TString& name, const void* group);
-    // Ends the region together with the regions opened inside it.
-    void EndRegion(TStringBuf name);
+    // Ends the region of the group together with the regions opened inside it.
+    void EndRegion(TStringBuf name, const void* group, bool success = true);
 
-    // Ends remaining regions. This trace records no further regions.
+    // Ends remaining regions: the compilation ended, also when it was stopped
+    // while waiting. This trace records no further regions.
     void Finish(bool success);
 
 private:
@@ -112,10 +95,6 @@ private:
         NWilson::TSpan Span;
     };
     TVector<TRegion> Regions;
-    TVector<NWilson::TTraceId> AwaitedDependencies;
-    std::shared_ptr<TCompileTraceContinuation> Continuation;
-    NWilson::TSpan ExecutionSpan;
-    ui32 Running = 0;
     bool Finished = false;
 };
 
@@ -126,8 +105,9 @@ void FinishCompileDependency(NWilson::TSpan& span, bool futureSuccess, bool oper
 
 // Ends the dependency span on the future's callback thread, before releasing its
 // consumer: end(span, result) ends it, where result points to the value or is
-// null for an exception (a bool for a void future).
-// For a value future this transfers its result to the returned future: the
+// null for an exception (a bool for a void future). The span runs concurrently
+// with the compiler, so it may outlive the compilation.
+// For a move-only value this transfers the result to the returned future: the
 // caller must consume the returned future instead of retaining the original.
 // Captures no compiler/transformer state, which may be destroyed while waiting.
 template <class T, class TEnd>
@@ -151,6 +131,10 @@ NThreading::TFuture<T> TraceCompileDependencyWith(NThreading::TFuture<T> future,
         span->Attribute("ydb.compile.future_outcome", TString("value"));
         if constexpr (std::is_void_v<T>) {
             end(*span, true);
+        } else if constexpr (std::is_copy_constructible_v<T>) {
+            const T& result = ready.GetValue();
+            end(*span, &result);
+            return result;
         } else {
             auto owned = ready;
             auto result = owned.ExtractValue();
@@ -198,19 +182,6 @@ private:
     bool Success = true;
 };
 
-class TCompileTraceRunScope {
-public:
-    explicit TCompileTraceRunScope(TCompileTrace::TPtr trace, const NWilson::TTraceId& readyFrom = {});
-    ~TCompileTraceRunScope();
-
-    TCompileTraceRunScope(const TCompileTraceRunScope&) = delete;
-    TCompileTraceRunScope& operator=(const TCompileTraceRunScope&) = delete;
-
-private:
-    // Completion/fallback may replace the actor's trace before this scope ends.
-    const TCompileTrace::TPtr Trace;
-};
-
 // Reserve the parent before applying a rule, but emit only applied rules,
 // failed rules, or rules whose children need a parent. Unproductive leaf
 // attempts do not create exported spans.
@@ -230,7 +201,7 @@ private:
     const int UncaughtExceptions;
     NWilson::TTraceId Parent;
     NWilson::TTraceId Id;
-    TInstant Start;
+    ui64 StartUnixNano = 0;
     bool Applied = false;
 };
 

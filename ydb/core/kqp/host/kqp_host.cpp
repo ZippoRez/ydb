@@ -2359,7 +2359,7 @@ private:
             return CreateCompileTraceBegin(queryCtx, TCompileTraceLevels::Phase, name, &YqlTransformerNewRBO);
         };
         const auto endTrace = [&](const TString& name) {
-            return CreateCompileTraceEnd(queryCtx, name);
+            return CreateCompileTraceEnd(queryCtx, name, &YqlTransformerNewRBO);
         };
 
         YqlTransformerNewRBO = TTransformationPipeline(TypesCtx)

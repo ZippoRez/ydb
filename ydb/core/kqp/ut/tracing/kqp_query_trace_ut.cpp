@@ -748,24 +748,25 @@ Y_UNIT_TEST_SUITE(TKqpQueryTrace) {
         AssertStatus(*uploader, "Compile query", NTraceProto::Status::STATUS_CODE_ERROR);
     }
 
-    Y_UNIT_TEST(NewRboCompilationTrace) {
+    NKqp::TKikimrSettings NewRboTracingSettings() {
         auto settings = ExternalTracingSettings();
         settings.AppConfig.MutableTableServiceConfig()->SetEnableNewRBO(true);
         settings.AppConfig.MutableTableServiceConfig()->SetEnableFallbackToYqlOptimizer(false);
         settings.AppConfig.MutableTableServiceConfig()->SetEnableFallbackOnMultipleStatements(true);
         settings.AppConfig.MutableTableServiceConfig()->SetAllowOlapDataQuery(true);
-        NKqp::TKikimrRunner kikimr(settings);
-        auto& runtime = *kikimr.GetTestServer().GetRuntime();
-        RegisterUploader(runtime);
-        auto client = kikimr.GetQueryClient();
+        return settings;
+    }
+
+    void CreateJoinTables(NYdb::NQuery::TQueryClient& client) {
         for (const TString table : {"Customers", "Orders"}) {
             auto result = client.ExecuteQuery(TStringBuilder()
                 << "CREATE TABLE `/Root/" << table << "` (Id Int64 NOT NULL, Ref Int64, Value Int64, PRIMARY KEY (Id)) "
                 << "WITH (STORE = COLUMN);", NYdb::NQuery::TTxControl::NoTx()).GetValueSync();
             UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
         }
+    }
 
-        const TString traceparent = "00-66666666666666666666666666666666-6666666666666666-01";
+    TTraceSnapshot ExplainJoinQuery(TTestActorRuntime& runtime, NYdb::NQuery::TQueryClient& client, const TString& traceparent) {
         auto result = client.ExecuteQuery(R"(
             SELECT c.Id, SUM(o.Value) AS Total
             FROM `/Root/Customers` AS c JOIN `/Root/Orders` AS o ON c.Id = o.Ref
@@ -774,14 +775,22 @@ Y_UNIT_TEST_SUITE(TKqpQueryTrace) {
         )", NYdb::NQuery::TTxControl::NoTx(), NYdb::NQuery::TExecuteQuerySettings()
             .ExecMode(NYdb::NQuery::EExecMode::Explain).TraceParent(traceparent)).GetValueSync();
         UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+        return WaitForExternalTrace(runtime, traceparent, {"Get query plan", "Compile query", "Build explain plan"});
+    }
 
-        auto snapshot = WaitForExternalTrace(runtime, traceparent, {"Compile query", "Build explain plan", "Cleanup compiler"});
+    Y_UNIT_TEST(NewRboCompilationPhases) {
+        NKqp::TKikimrRunner kikimr(NewRboTracingSettings());
+        auto& runtime = *kikimr.GetTestServer().GetRuntime();
+        RegisterUploader(runtime);
+        auto client = kikimr.GetQueryClient();
+        CreateJoinTables(client);
+        const auto snapshot = ExplainJoinQuery(runtime, client, "00-66666666666666666666666666666666-6666666666666666-01");
+
         for (const TStringBuf phase : {"Parse query", "IO annotation", "Prepare physical query"}) {
             AssertDescendant(snapshot, phase, "Compile query");
             AssertStatus(snapshot, phase, NTraceProto::Status::STATUS_CODE_OK);
         }
-        for (const TStringBuf phase : {"Build KQL query", "Optimize (new RBO)",
-                "Compile physical query", "Build explain plan"}) {
+        for (const TStringBuf phase : {"Build KQL query", "Optimize (new RBO)", "Compile physical query", "Build explain plan"}) {
             AssertDescendant(snapshot, phase, "Prepare physical query");
             AssertStatus(snapshot, phase, NTraceProto::Status::STATUS_CODE_OK);
         }
@@ -789,93 +798,85 @@ Y_UNIT_TEST_SUITE(TKqpQueryTrace) {
             AssertDescendant(snapshot, step, "Optimize (new RBO)");
             AssertStatus(snapshot, step, NTraceProto::Status::STATUS_CODE_OK);
         }
-        AssertDescendant(snapshot, "Build physical query", "Convert to physical plan");
         AssertDescendant(snapshot, "Compile OLAP program", "Compile physical query");
-        AssertDescendant(snapshot, "Load metadata", "IO annotation");
-        AssertDescendant(snapshot, "Create graph transformer", "Compile query");
-        AssertDescendant(snapshot, "Annotate physical stage", "Convert to physical plan");
-        for (const TStringBuf name : {"Create OLAP compile context", "Build OLAP program",
-                "Serialize OLAP program", "Destroy OLAP compile context"}) {
-            AssertDescendant(snapshot, name, "Compile OLAP program");
-            AssertStatus(snapshot, name, NTraceProto::Status::STATUS_CODE_OK);
-        }
-        for (const TStringBuf name : {"Peephole: KqpPeephole", "Peephole: KqpPeepholeFinal",
-                "Peephole: KqpPeepholeNewOperator", "Peephole: KqpPeepholeBlockPackUnpack"}) {
-            AssertDescendant(snapshot, name, "Convert to physical plan");
-            AssertStatus(snapshot, name, NTraceProto::Status::STATUS_CODE_OK);
-        }
-        for (const TStringBuf name : {"Prepare CBO join tree", "CBO join search", "Rebuild CBO plan"}) {
-            AssertDescendant(snapshot, name, "Rule: Optimize CBO tree");
-            for (const auto& child : snapshot.Spans) {
-                if (child.name() == name) {
-                    const auto* parent = FindParent(snapshot, child);
-                    UNIT_ASSERT(parent && parent->name() == "Rule: Optimize CBO tree");
-                    UNIT_ASSERT_LE(parent->start_time_unix_nano(), child.start_time_unix_nano());
-                    UNIT_ASSERT_LE(child.end_time_unix_nano(), parent->end_time_unix_nano());
-                }
-            }
-        }
-        AssertDescendant(snapshot, "Rule: Optimize CBO tree", "RBO stage: Invoke CBO");
-        AssertDescendant(snapshot, "Cleanup compiler", "Compile query");
-        const auto& cleanup = *FindSpan(snapshot, "Cleanup compiler");
-        const auto* compile = FindParent(snapshot, cleanup);
-        UNIT_ASSERT(compile && compile->name() == "Compile query");
-        UNIT_ASSERT(FindAttribute(cleanup, "ydb.compile.cleanup")->value().bool_value());
-        const auto* plan = FindParent(snapshot, *compile);
-        UNIT_ASSERT(plan && plan->name() == "Get query plan");
-        auto eventTime = [](const auto& span, TStringBuf name) -> ui64 {
-            for (const auto& event : span.events()) {
-                if (event.name() == name) {
-                    return event.time_unix_nano();
-                }
-            }
-            UNIT_FAIL("Missing handoff event " << name);
-            return 0;
-        };
-        UNIT_ASSERT_LE(eventTime(*plan, "Compilation dispatched"),
-            eventTime(*compile, "Compilation started") + 1'000'000);
-        UNIT_ASSERT_LE(eventTime(*compile, "Compilation reply dispatched"),
-            eventTime(*plan, "Compilation reply received") + 1'000'000);
-        UNIT_ASSERT_LE(eventTime(*compile, "Compilation reply dispatched"), cleanup.start_time_unix_nano() + 1'000'000);
-        UNIT_ASSERT(std::ranges::any_of(compile->links(), [&](const auto& link) {
-            return link.span_id() == plan->span_id()
-                && FindAttribute(link, "ydb.compile.relation")->value().string_value() == "dispatch";
-        }));
-        UNIT_ASSERT(std::ranges::any_of(plan->links(), [&](const auto& link) {
-            return link.span_id() == compile->span_id()
-                && FindAttribute(link, "ydb.compile.relation")->value().string_value() == "reply";
-        }));
-        const auto* metadataWait = FindSpan(snapshot, "Await table metadata");
-        UNIT_ASSERT(metadataWait && metadataWait->links_size());
-        UNIT_ASSERT_VALUES_EQUAL(FindAttribute(*metadataWait, "ydb.compile.join")->value().string_value(), "all_or_error");
-        UNIT_ASSERT(FindSpan(snapshot, "Compiler execution"));
-        UNIT_ASSERT(FindSpan(snapshot, "Compiler continuation"));
-        AssertDescendant(snapshot, "Load metadata", "Await table metadata");
-        AssertDescendant(snapshot, "Await table metadata", "IO annotation");
-        // Wilson derives end times from each span's cycle clock; allow their
-        // small drift relative to the wall-clock starts of later child spans.
-        UNIT_ASSERT_LE(cleanup.end_time_unix_nano(), compile->end_time_unix_nano() + TDuration::MilliSeconds(1).NanoSeconds());
 
+        // Applied rules are emitted under their stage; work they do nests in them.
         const auto* rule = FindSpanByPrefix(snapshot, "Rule: ");
         UNIT_ASSERT_C(rule, snapshot.PrintTraces());
         const auto* stage = FindParent(snapshot, *rule);
         UNIT_ASSERT_C(stage && stage->name().StartsWith("RBO stage: "), snapshot.PrintTraces());
-        // Rules are timed on the clock of their stage, so they nest within it.
-        UNIT_ASSERT_GE_C(rule->start_time_unix_nano(), stage->start_time_unix_nano(), rule->DebugString());
-        UNIT_ASSERT_LE_C(rule->end_time_unix_nano(), stage->end_time_unix_nano(), rule->DebugString());
+        AssertDescendant(snapshot, "CBO join search", "Rule: Optimize CBO tree");
+
+        // All compiler spans form one stack, including the rules emitted after the fact.
+        AssertFlowsNest(snapshot, "Get query plan");
+    }
+
+    Y_UNIT_TEST(NewRboCompilationFlows) {
+        NKqp::TKikimrRunner kikimr(NewRboTracingSettings());
+        auto& runtime = *kikimr.GetTestServer().GetRuntime();
+        RegisterUploader(runtime);
+        auto client = kikimr.GetQueryClient();
+        CreateJoinTables(client);
+        const auto snapshot = ExplainJoinQuery(runtime, client, "00-99999999999999999999999999999999-9999999999999999-01");
+
+        const auto isAsync = [](const auto& span) {
+            const auto* flow = FindAttribute(span, NKqp::FlowAttribute);
+            return flow && flow->value().string_value() == NKqp::AsyncFlow;
+        };
+        const auto dependsOn = [](const auto& span, const auto& dependency) {
+            return std::ranges::any_of(span.links(), [&](const auto& link) {
+                const auto* relation = FindAttribute(link, NKqp::RelationAttribute);
+                return link.span_id() == dependency.span_id()
+                    && relation && relation->value().string_value() == NKqp::DependsOnRelation;
+            });
+        };
+
+        // The compile actor is a flow of its own; the compile service waits for its result.
+        const auto& compile = *FindSpan(snapshot, "Compile query");
+        const auto* plan = FindParent(snapshot, compile);
+        UNIT_ASSERT(plan && plan->name() == "Get query plan");
+        UNIT_ASSERT(isAsync(compile));
+        UNIT_ASSERT(dependsOn(*plan, compile));
+        UNIT_ASSERT_LE(compile.end_time_unix_nano(), plan->end_time_unix_nano());
+
+        // Metadata loads run concurrently with the compiler, which waits for all of them.
+        const auto& metadataWait = *FindSpan(snapshot, "Await table metadata");
+        UNIT_ASSERT(isAsync(metadataWait));
+        AssertDescendant(snapshot, "Await table metadata", "IO annotation");
+        size_t tables = 0;
+        for (const auto& span : snapshot.Spans) {
+            if (span.name() == "Resolve table metadata") {
+                ++tables;
+                UNIT_ASSERT(isAsync(span));
+                UNIT_ASSERT(dependsOn(metadataWait, span));
+            }
+        }
+        UNIT_ASSERT_VALUES_EQUAL(tables, 2);
+        AssertDescendant(snapshot, "Load metadata", "Resolve table metadata");
+        UNIT_ASSERT(isAsync(*FindSpan(snapshot, "Load metadata")));
+
+        AssertFlowsNest(snapshot, "Get query plan");
+    }
+
+    Y_UNIT_TEST(NewRboFailedConversionTrace) {
+        NKqp::TKikimrRunner kikimr(NewRboTracingSettings());
+        auto& runtime = *kikimr.GetTestServer().GetRuntime();
+        RegisterUploader(runtime);
+        auto client = kikimr.GetQueryClient();
+        CreateJoinTables(client);
 
         // OptimizeExpr catches the conversion exception and returns Error. The
         // scope must record that result instead of reporting a successful span.
-        const TString failedTrace = "00-77777777777777777777777777777777-7777777777777777-01";
+        const TString traceparent = "00-77777777777777777777777777777777-7777777777777777-01";
         auto failed = client.ExecuteQuery(
             "SELECT Id FROM `/Root/Customers`; SELECT Id FROM `/Root/Orders`;",
             NYdb::NQuery::TTxControl::NoTx(), NYdb::NQuery::TExecuteQuerySettings()
-                .ExecMode(NYdb::NQuery::EExecMode::Explain).TraceParent(failedTrace)).GetValueSync();
+                .ExecMode(NYdb::NQuery::EExecMode::Explain).TraceParent(traceparent)).GetValueSync();
         UNIT_ASSERT(!failed.IsSuccess());
-        auto failedSnapshot = WaitForExternalTrace(runtime, failedTrace, {"Compile query", "Convert to RBO plan"});
-        AssertStatus(failedSnapshot, "Convert to RBO plan", NTraceProto::Status::STATUS_CODE_ERROR);
-        AssertStatus(failedSnapshot, "Compile query", NTraceProto::Status::STATUS_CODE_ERROR);
-        AssertDescendant(failedSnapshot, "Cleanup compiler", "Compile query");
+        const auto snapshot = WaitForExternalTrace(runtime, traceparent, {"Get query plan", "Compile query", "Convert to RBO plan"});
+        AssertStatus(snapshot, "Convert to RBO plan", NTraceProto::Status::STATUS_CODE_ERROR);
+        AssertStatus(snapshot, "Compile query", NTraceProto::Status::STATUS_CODE_ERROR);
+        AssertFlowsNest(snapshot, "Get query plan");
     }
 
     Y_UNIT_TEST(CompilerFallbackKeepsBothAttempts) {
@@ -899,11 +900,12 @@ Y_UNIT_TEST_SUITE(TKqpQueryTrace) {
         )", NYdb::NQuery::TTxControl::NoTx(), NYdb::NQuery::TExecuteQuerySettings()
             .ExecMode(NYdb::NQuery::EExecMode::Explain).TraceParent(traceparent)).GetValueSync();
         UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
-        auto snapshot = WaitForExternalTrace(runtime, traceparent, {"Compile query", "Cleanup compiler"});
+        auto snapshot = WaitForExternalTrace(runtime, traceparent, {"Get query plan", "Compile query"});
         AssertStatus(snapshot, "Compile query", NTraceProto::Status::STATUS_CODE_OK);
         // The failed new RBO attempt stays under the Compile query that the
-        // YQL optimizer completes.
+        // YQL optimizer completes, and its phases end before the retry.
         AssertDescendant(snapshot, "IO annotation", "Compile query");
+        AssertFlowsNest(snapshot, "Get query plan");
     }
 
     Y_UNIT_TEST_TWIN(SnapshotManagerTracePropagation, Mvcc) {
@@ -1080,7 +1082,13 @@ Y_UNIT_TEST_SUITE(TKqpQueryTrace) {
         UNIT_ASSERT(metadata && stats && initiating);
         UNIT_ASSERT_VALUES_EQUAL(metadata->parent_span_id(), initiating->span_id());
         UNIT_ASSERT_VALUES_EQUAL(stats->parent_span_id(), initiating->span_id());
-        UNIT_ASSERT_LE(metadata->end_time_unix_nano(), stats->start_time_unix_nano() + 1000);
+        // Statistics are requested once the metadata request has completed.
+        UNIT_ASSERT_LE(metadata->end_time_unix_nano(), stats->start_time_unix_nano());
+        UNIT_ASSERT(std::ranges::any_of(stats->links(), [&](const auto& link) {
+            const auto* relation = FindAttribute(link, NKqp::RelationAttribute);
+            return link.span_id() == metadata->span_id()
+                && relation && relation->value().string_value() == NKqp::FollowsFromRelation;
+        }));
         AssertStatus(*uploader, "Load statistics", NTraceProto::Status::STATUS_CODE_ERROR);
     }
 

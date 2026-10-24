@@ -485,7 +485,8 @@ private:
                 .AddTypeAnnotationTransformer()
                 //.Add(CreateKqpCheckQueryTransformer(), "CheckKqlQuery")
                 .AddPostTypeAnnotation(/* forSubgraph */ true)
-                .Add(CreateCompileTraceEnd(sessionCtx->QueryPtr(), "Annotate KQL query"), "TraceEndAnnotateKqlQuery")
+                .Add(CreateCompileTraceEnd(sessionCtx->QueryPtr(), "Annotate KQL query", &NewRBOTransformer),
+                    "TraceEndAnnotateKqlQuery")
                 //.AddCommonOptimization()
 
                 .Add(traced(CreateKqpRewriteSelectTransformer(OptimizeCtx, *typesCtx), "Rewrite select"), "RewriteSelect")

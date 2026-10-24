@@ -12,8 +12,6 @@
 #include <yql/essentials/minikql/mkql_function_registry.h>
 
 #include <memory>
-#include <optional>
-#include <util/generic/scope.h>
 
 namespace NKikimr {
 namespace NKqp {
@@ -1238,25 +1236,16 @@ void CompileOlapProgram(const TCoLambda& lambda, const TKikimrTableMetadata& tab
 {
     YQL_ENSURE(lambda.Args().Size() == 1);
 
-    std::optional<TKqpOlapCompileContext> ctx;
-    {
-        TCompileTraceScope scope(trace, TCompileTraceLevels::Detail, "Create OLAP compile context");
-        ctx.emplace(lambda.Args().Arg(0), tableMeta, readProto, resultColNames, exprCtx, typesCtx);
-    }
-    Y_DEFER {
-        // The registry is owned by the context: time its actual destruction,
-        // including when program compilation or serialization throws.
-        TCompileTraceScope scope(trace, TCompileTraceLevels::Detail, "Destroy OLAP compile context");
-        ctx.reset();
-    };
+    TKqpOlapCompileContext ctx(lambda.Args().Arg(0), tableMeta, readProto, resultColNames, exprCtx, typesCtx);
+
     {
         TCompileTraceScope scope(trace, TCompileTraceLevels::Detail, "Build OLAP program");
-        CompileOlapProgramImpl(lambda.Body(), *ctx);
-        CompileFinalProjection(*ctx);
+        CompileOlapProgramImpl(lambda.Body(), ctx);
+        CompileFinalProjection(ctx);
     }
     {
         TCompileTraceScope scope(trace, TCompileTraceLevels::Detail, "Serialize OLAP program");
-        ctx->SerializeToProto();
+        ctx.SerializeToProto();
     }
 }
 

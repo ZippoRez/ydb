@@ -13,7 +13,7 @@
 #include <ydb/library/yql/dq/actors/protos/dq_events.pb.h>
 #include <ydb/library/yql/dq/proto/dq_tasks.pb.h>
 
-#include <util/generic/scope.h>
+#include <util/string/join.h>
 
 #include <chrono>
 #include <thread>
@@ -44,7 +44,7 @@ Y_UNIT_TEST_SUITE(TKqpTrace) {
             {
                 NKqp::TCompileTraceScope work(&trace, 15, "Resumed work");
             }
-            trace.EndRegion("Phase");
+            trace.EndRegion("Phase", &group);
         });
         worker.join();
         trace.Finish(true);
@@ -55,81 +55,6 @@ Y_UNIT_TEST_SUITE(TKqpTrace) {
         AssertDescendant(*uploader, "Resumed work", "Phase");
         AssertStatus(*uploader, "Phase", NTraceProto::Status::STATUS_CODE_OK);
         UNIT_ASSERT(uploader->BuildTraceTrees());
-    }
-
-    Y_UNIT_TEST(ContinuationHandoffAndCancellation) {
-        NActors::TTestActorRuntimeBase runtime;
-        runtime.Initialize();
-        auto* uploader = RegisterUploader(runtime);
-        NWilson::TSpan query(15, NWilson::TTraceId::NewTraceId(15, 4095), "Query",
-            NWilson::EFlags::NONE, runtime.GetActorSystem(0));
-        auto trace = MakeIntrusive<NKqp::TCompileTrace>(query.GetTraceId(), runtime.GetActorSystem(0));
-        const int group = 0;
-        trace->BeginRegion(14, "Phase across wait", &group);
-        auto dependency = trace->StartSpan(14, "Dependency");
-        std::shared_ptr<NKqp::TCompileTraceContinuation> continuation;
-        {
-            NKqp::TCompileTraceRunScope running(trace);
-            trace->AwaitDependency(dependency.GetTraceId());
-            trace->AwaitDependency(dependency.GetTraceId());
-            continuation = trace->StartContinuation();
-        }
-        NWilson::TTraceId readyFrom;
-        std::thread callback([&] {
-            dependency.EndOk();
-            readyFrom = continuation->Complete();
-        });
-        callback.join();
-        UNIT_ASSERT(readyFrom);
-        UNIT_ASSERT(!continuation->Complete());
-        {
-            NKqp::TCompileTraceRunScope resumed(trace, readyFrom);
-            NKqp::TCompileTraceRunScope nested(trace);
-            NKqp::TCompileTraceScope work(trace.Get(), 14, "Resumed work");
-        }
-        trace->Finish(true);
-        query.EndOk();
-        runtime.SimulateSleep(TDuration::MilliSeconds(1));
-        AssertDescendant(*uploader, "Resumed work", "Phase across wait");
-        const auto* wait = FindSpan(*uploader, "Compiler continuation");
-        UNIT_ASSERT(wait && wait->links_size() == 1);
-        UNIT_ASSERT_VALUES_EQUAL(wait->links(0).span_id(), FindSpan(*uploader, "Dependency")->span_id());
-        size_t turns = 0, resumptions = 0;
-        for (const auto& span : uploader->Spans) {
-            if (span.name() != "Compiler execution") {
-                continue;
-            }
-            ++turns;
-            UNIT_ASSERT(!FindAttribute(span, "ydb.cpu_us"));
-            UNIT_ASSERT(!FindAttribute(span, "thread.id"));
-            for (const auto& link : span.links()) {
-                ++resumptions;
-                UNIT_ASSERT_VALUES_EQUAL(link.span_id(), wait->span_id());
-                UNIT_ASSERT_LE(wait->end_time_unix_nano(), span.start_time_unix_nano() + 1'000'000);
-            }
-        }
-        UNIT_ASSERT_VALUES_EQUAL(turns, 2);
-        UNIT_ASSERT_VALUES_EQUAL(resumptions, 1);
-
-        // Completion can race with timeout/fallback; it must emit one terminal
-        // span and a late callback must not resurrect the finished trace.
-        for (size_t i = 0; i < 8; ++i) {
-            NWilson::TSpan root(15, NWilson::TTraceId::NewTraceId(15, 4095), "Cancelled query",
-                NWilson::EFlags::NONE, runtime.GetActorSystem(0));
-            auto cancelled = MakeIntrusive<NKqp::TCompileTrace>(root.GetTraceId(), runtime.GetActorSystem(0));
-            auto pending = cancelled->StartContinuation();
-            std::thread completing([&] { pending->Complete(); });
-            cancelled->Finish(false);
-            completing.join();
-            UNIT_ASSERT(!pending->Complete());
-            UNIT_ASSERT(!cancelled->StartContinuation());
-            cancelled->Resume();
-            cancelled->Suspend();
-            root.EndError("cancelled");
-        }
-        runtime.SimulateSleep(TDuration::MilliSeconds(1));
-        UNIT_ASSERT_VALUES_EQUAL(std::ranges::count_if(uploader->Spans,
-            [](const auto& span) { return span.name() == "Compiler continuation"; }), 9);
     }
 
     Y_UNIT_TEST(DependencyJoinPreservesReadinessAndFailure) {
@@ -156,6 +81,11 @@ Y_UNIT_TEST_SUITE(TKqpTrace) {
         auto value = NKqp::TraceCompileDependency(NThreading::MakeFuture(std::make_unique<int>(42)),
             trace.StartSpan(14, "Move-only dependency"));
         UNIT_ASSERT_VALUES_EQUAL(*value.ExtractValue(), 42);
+        // A copyable value stays available to other holders of the original future.
+        const auto shared = NThreading::MakeFuture(TString("shared"));
+        auto copied = NKqp::TraceCompileDependency(shared, trace.StartSpan(14, "Copyable dependency"));
+        UNIT_ASSERT_VALUES_EQUAL(copied.GetValue(), "shared");
+        UNIT_ASSERT_VALUES_EQUAL(shared.GetValue(), "shared");
 
         // A failed operation can still return a value: it must not turn an
         // all-or-exception join into a fail-fast join or discard the result.
@@ -191,7 +121,7 @@ Y_UNIT_TEST_SUITE(TKqpTrace) {
         runtime.Initialize();
         auto* uploader = RegisterUploader(runtime);
         NWilson::TSpan root(15, NWilson::TTraceId::NewTraceId(15, 4095), "Query",
-            NWilson::EFlags::WALL_CLOCK, runtime.GetActorSystem(0));
+            NWilson::EFlags::NONE, runtime.GetActorSystem(0));
         NKqp::TCompileTrace trace(root.GetTraceId(), runtime.GetActorSystem(0));
         {
             NKqp::TCompileTraceScope stage(&trace, 15, "Stage");
@@ -229,45 +159,6 @@ Y_UNIT_TEST_SUITE(TKqpTrace) {
         UNIT_ASSERT(uploader->BuildTraceTrees());
     }
 
-    Y_UNIT_TEST(WallClockBoundariesDoNotDependOnCycleCalibration) {
-        NActors::TTestActorRuntimeBase runtime;
-        runtime.Initialize();
-        auto* uploader = RegisterUploader(runtime);
-        NWilson::TSpan root(15, NWilson::TTraceId::NewTraceId(15, 4095), "Query",
-            NWilson::EFlags::WALL_CLOCK, runtime.GetActorSystem(0));
-        NKqp::TCompileTrace trace(root.GetTraceId(), runtime.GetActorSystem(0));
-        ui64 eventBefore, eventAfter, endBefore, endAfter;
-        {
-            // Amplify the clock mismatch deterministically, without long sleeps.
-            const ui64 cyclesPerSecond = GetCyclesPerMillisecond() * 1000;
-            SetCyclesPerSecond(cyclesPerSecond / 2);
-            Y_DEFER { SetCyclesPerSecond(0); };
-            {
-                NKqp::TCompileTraceScope first(&trace, 15, "First synchronous step");
-                auto child = root.CreateChild(15, "Inherited wall clock");
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                eventBefore = TInstant::Now().NanoSeconds();
-                child.Event("Ready");
-                eventAfter = TInstant::Now().NanoSeconds();
-                endBefore = TInstant::Now().NanoSeconds();
-                child.EndOk();
-                endAfter = TInstant::Now().NanoSeconds();
-            }
-            NKqp::TCompileTraceScope next(&trace, 15, "Next synchronous step");
-        }
-        root.EndOk();
-        runtime.SimulateSleep(TDuration::MilliSeconds(1));
-        const auto& first = *FindSpan(*uploader, "First synchronous step");
-        const auto& next = *FindSpan(*uploader, "Next synchronous step");
-        const auto& child = *FindSpan(*uploader, "Inherited wall clock");
-        UNIT_ASSERT_LE(first.end_time_unix_nano(), next.start_time_unix_nano());
-        UNIT_ASSERT_VALUES_EQUAL(child.events_size(), 1);
-        UNIT_ASSERT_LE(eventBefore, child.events(0).time_unix_nano());
-        UNIT_ASSERT_LE(child.events(0).time_unix_nano(), eventAfter);
-        UNIT_ASSERT_LE(endBefore, child.end_time_unix_nano());
-        UNIT_ASSERT_LE(child.end_time_unix_nano(), endAfter);
-    }
-
     Y_UNIT_TEST(RestartReopensRegionsAndEndsNestedOnes) {
         class TProducer : public NActors::TActorBootstrapped<TProducer> {
         public:
@@ -282,7 +173,7 @@ Y_UNIT_TEST_SUITE(TKqpTrace) {
                 trace.BeginRegion(15, "Host region", &pipeline); // Already open: a restart inside it.
                 // The pipeline restarts from its first region.
                 trace.BeginRegion(15, "First region", &pipeline);
-                trace.EndRegion("First region");
+                trace.EndRegion("First region", &pipeline);
                 trace.Finish(true);
                 root.EndOk();
                 PassAway();
@@ -304,6 +195,86 @@ Y_UNIT_TEST_SUITE(TKqpTrace) {
             AssertStatus(*uploader, name, NTraceProto::Status::STATUS_CODE_OK);
         }
         UNIT_ASSERT(uploader->BuildTraceTrees());
+    }
+
+    Y_UNIT_TEST(EndRegionMatchesItsGroup) {
+        NActors::TTestActorRuntimeBase runtime;
+        runtime.Initialize();
+        auto* uploader = RegisterUploader(runtime);
+        NWilson::TSpan query(15, NWilson::TTraceId::NewTraceId(15, 4095), "Query",
+            NWilson::EFlags::NONE, runtime.GetActorSystem(0));
+        NKqp::TCompileTrace trace(query.GetTraceId(), runtime.GetActorSystem(0));
+        const int outer = 0;
+        const int inner = 0;
+        trace.BeginRegion(15, "Outer", &outer);
+        trace.BeginRegion(15, "Annotation", &inner);
+        trace.EndRegion("Annotation", &outer); // Another group: no effect.
+        {
+            NKqp::TCompileTraceScope work(&trace, 15, "Annotated work");
+        }
+        trace.EndRegion("Annotation", &inner);
+        trace.EndRegion("Outer", &outer, false);
+        trace.Finish(true);
+        query.EndOk();
+        runtime.SimulateSleep(TDuration::MilliSeconds(1));
+
+        AssertDescendant(*uploader, "Annotated work", "Annotation");
+        AssertStatus(*uploader, "Annotation", NTraceProto::Status::STATUS_CODE_OK);
+        AssertStatus(*uploader, "Outer", NTraceProto::Status::STATUS_CODE_ERROR);
+        UNIT_ASSERT(uploader->BuildTraceTrees());
+    }
+
+    Y_UNIT_TEST(FinishEndsRegionsOpenAcrossWaits) {
+        NActors::TTestActorRuntimeBase runtime;
+        runtime.Initialize();
+        auto* uploader = RegisterUploader(runtime);
+        NWilson::TSpan query(15, NWilson::TTraceId::NewTraceId(15, 4095), "Query",
+            NWilson::EFlags::NONE, runtime.GetActorSystem(0));
+        auto trace = MakeIntrusive<NKqp::TCompileTrace>(query.GetTraceId(), runtime.GetActorSystem(0));
+        const int group = 0;
+        // The compilation stops while a phase waits, e.g. on a timeout.
+        trace->BeginRegion(15, "Waiting phase", &group);
+        trace->Finish(false);
+        trace->BeginRegion(15, "After finish", &group);
+        query.EndError("stopped");
+        runtime.SimulateSleep(TDuration::MilliSeconds(1));
+
+        AssertStatus(*uploader, "Waiting phase", NTraceProto::Status::STATUS_CODE_ERROR);
+        const auto& phase = *FindSpan(*uploader, "Waiting phase");
+        const auto& root = *FindSpan(*uploader, "Query");
+        UNIT_ASSERT_LE(phase.end_time_unix_nano(), root.end_time_unix_nano());
+        UNIT_ASSERT(!FindSpan(*uploader, "After finish"));
+    }
+
+    Y_UNIT_TEST(FlowNestingViolations) {
+        NActors::TTestActorRuntimeBase runtime;
+        runtime.Initialize();
+        auto* uploader = RegisterUploader(runtime);
+        NWilson::TSpan root(15, NWilson::TTraceId::NewTraceId(15, 4095), "Root",
+            NWilson::EFlags::NONE, runtime.GetActorSystem(0));
+        const auto pause = [] {
+            // Distinct timestamps, whatever the resolution of the clock.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        };
+        auto request = root.CreateChild(15, "Request");
+        NKqp::MarkAsyncFlow(request);
+        auto unmarked = root.CreateChild(15, "Unmarked request");
+        pause();
+        {
+            auto step = root.CreateChild(15, "Step");
+            step.EndOk();
+        }
+        root.EndOk();
+        pause();
+        // Both requests outlive the root; only the marked one may.
+        request.EndOk();
+        unmarked.EndOk();
+        runtime.SimulateSleep(TDuration::MilliSeconds(1));
+
+        auto violations = FindFlowNestingViolations(*uploader, "Root");
+        std::ranges::sort(violations);
+        UNIT_ASSERT_VALUES_EQUAL(JoinSeq("; ", violations),
+            "Step overlaps Unmarked request in Root; Unmarked request sticks out of its parent Root");
     }
 
     TFakeWilsonUploader* RegisterUploader(NActors::TTestActorRuntimeBase& runtime) {

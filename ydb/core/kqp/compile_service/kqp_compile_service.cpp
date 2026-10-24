@@ -1,7 +1,7 @@
 #include "kqp_compile_service.h"
 #include "helpers/kqp_compile_service_helpers.h"
 
-#include <ydb/core/kqp/tracing/kqp_compile_trace.h>
+#include <ydb/core/kqp/tracing/kqp_trace_flow.h>
 #include <ydb/core/kqp/tracing/kqp_query_rendering.h>
 #include <ydb/core/actorlib_impl/long_timer.h>
 #include <ydb/core/base/appdata.h>
@@ -536,7 +536,9 @@ private:
         YDB_LOG_DEBUG_CTX(ctx, "Performing compile request",
             {"spanIdPtr", ev->TraceId.GetSpanIdPtr()});
 
-        NWilson::TSpan compileServiceSpan(TWilsonKqp::CompileService, std::move(ev->TraceId), "Get query plan", NWilson::EFlags::WALL_CLOCK);
+        NWilson::TSpan compileServiceSpan(TWilsonKqp::CompileService, std::move(ev->TraceId), "Get query plan");
+        // The compile service works concurrently with its requester.
+        MarkAsyncFlow(compileServiceSpan);
 
         YDB_LOG_DEBUG_CTX(ctx, "Received compile request",
             {"sender", ev->Sender},
@@ -655,7 +657,8 @@ private:
         if (compileResult || request.Query) {
             Counters->ReportCompileRequestCompile(dbCounters);
 
-            NWilson::TSpan compileServiceSpan(TWilsonKqp::CompileService, ev->Get() ? std::move(ev->TraceId) : NWilson::TTraceId(), "Get query plan", NWilson::EFlags::WALL_CLOCK);
+            NWilson::TSpan compileServiceSpan(TWilsonKqp::CompileService, ev->Get() ? std::move(ev->TraceId) : NWilson::TTraceId(), "Get query plan");
+            MarkAsyncFlow(compileServiceSpan);
 
             TKqpCompileSettings compileSettings(
                 true,
@@ -698,7 +701,8 @@ private:
 
             NYql::TIssue issue(NYql::TPosition(), TStringBuilder() << "Query not found: " << request.Uid);
 
-            NWilson::TSpan compileServiceSpan(TWilsonKqp::CompileService, ev->Get() ? std::move(ev->TraceId) : NWilson::TTraceId(), "Get query plan", NWilson::EFlags::WALL_CLOCK);
+            NWilson::TSpan compileServiceSpan(TWilsonKqp::CompileService, ev->Get() ? std::move(ev->TraceId) : NWilson::TTraceId(), "Get query plan");
+            MarkAsyncFlow(compileServiceSpan);
 
             ReplyError(ev->Sender, request.Uid, Ydb::StatusIds::NOT_FOUND, {issue}, ctx,
                 ev->Cookie, std::move(ev->Get()->Orbit), std::move(compileServiceSpan));
@@ -716,10 +720,8 @@ private:
         auto compileRequest = RequestsQueue.FinishActiveRequest(*compileResult->Query);
         Y_ABORT_UNLESS(compileRequest.CompileActor == compileActorId);
         Y_ABORT_UNLESS(compileRequest.Uid == compileResult->Uid);
-        if (ev->TraceId) {
-            compileRequest.CompileServiceSpan.Event("Compilation reply received");
-            compileRequest.CompileServiceSpan.Link(ev->TraceId, {{"ydb.compile.relation", TString("reply")}});
-        }
+        // The compile actor sends its span with the result.
+        LinkDependsOn(compileRequest.CompileServiceSpan, ev->TraceId);
 
         YDB_LOG_DEBUG_CTX(ctx, "Received response",
             {"sender", compileRequest.Sender},
@@ -985,10 +987,6 @@ private:
     }
 
     void StartCompilation(TKqpCompileRequest&& request, const TActorContext& ctx) {
-        if (request.CompileSettings.Action == ECompileActorAction::COMPILE && request.CompileServiceSpan
-            && request.CompileServiceSpan.GetTraceId().GetVerbosity() >= TCompileTraceLevels::Step) {
-            request.CompileServiceSpan.Event("Compilation dispatched");
-        }
         auto compileActor = CreateKqpCompileActor(ctx.SelfID, KqpSettings, TableServiceConfig, QueryServiceConfig, ModuleResolverState, Counters,
             request.Uid, request.Query, request.UserToken, request.ClientAddress, FederatedQuerySetup, request.DbCounters, request.GUCSettings, request.ApplicationName, request.UserRequestContext,
             request.CompileServiceSpan.GetTraceId(), request.TempTablesState, request.CompileSettings.Action, std::move(request.QueryAst), request.CollectDiagnostics,

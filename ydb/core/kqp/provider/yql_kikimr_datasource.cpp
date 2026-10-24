@@ -231,19 +231,21 @@ public:
             auto& result = emplaceResult.first->second;
 
             if (trace && !dependencyJoin) {
+                // Completes on the callback threads of the loads, concurrently with the compiler.
                 dependencyJoin = trace->StartSpan(NKikimr::NKqp::TCompileTraceLevels::Step,
                     "Await table metadata");
-                dependencyJoin.Attribute("ydb.compile.kind", TString("async"));
-                dependencyJoin.Attribute("ydb.compile.join", TString("all_or_error"));
+                NKikimr::NKqp::MarkAsyncFlow(dependencyJoin);
             }
+            // The loads of the tables run concurrently. The complete table future
+            // can include multiple gateway requests.
             auto dependency = dependencyJoin.CreateChild(NKikimr::NKqp::TCompileTraceLevels::Step,
                 "Resolve table metadata");
-            dependency.Attribute("ydb.compile.kind", TString("async"));
+            NKikimr::NKqp::MarkAsyncFlow(dependency);
+            dependency.Attribute("db.collection.name", tableName);
             if (dependencyJoin) {
                 dependencyResults.push_back(result);
-                dependencyJoin.Link(dependency.GetTraceId(), {{"ydb.compile.relation", TString("depends_on")}});
+                NKikimr::NKqp::LinkDependsOn(dependencyJoin, dependency.GetTraceId());
             }
-            // The complete table future can include multiple gateway requests.
             auto future = [&] {
                 if (trace) {
                     trace->Push(dependency);
@@ -295,12 +297,11 @@ public:
             return TStatus::Ok;
         }
 
-        // A missing table is a valid outcome, e.g. for CREATE TABLE: whether the
-        // query needs the table is checked later.
-        MetadataDependency = dependencyJoin.GetTraceId();
         AsyncFuture = NKikimr::NKqp::TraceCompileDependency(
             NThreading::WaitExceptionOrAll(futures), std::move(dependencyJoin),
             [results = std::move(dependencyResults)] {
+                // A missing table is a successful load, e.g. for CREATE TABLE:
+                // whether the query needs the table is checked later.
                 return std::ranges::all_of(results, [](const auto& result) {
                     return result->Success();
                 });
@@ -310,9 +311,6 @@ public:
 
     NThreading::TFuture<void> DoGetAsyncFuture(const TExprNode& input) final {
         Y_UNUSED(input);
-        if (auto* trace = SessionCtx->QueryPtr()->CompileTrace.Get()) {
-            trace->AwaitDependency(MetadataDependency);
-        }
         return AsyncFuture;
     }
 
@@ -470,7 +468,6 @@ public:
     void Rewind() final {
         LoadResults.clear();
         AsyncFuture = {};
-        MetadataDependency = {};
     }
 
 private:
@@ -482,7 +479,6 @@ private:
 
     THashMap<std::pair<TString, TString>, std::shared_ptr<IKikimrGateway::TTableMetadataResult>> LoadResults;
     NThreading::TFuture<void> AsyncFuture;
-    NWilson::TTraceId MetadataDependency;
 };
 
 class TKikimrConfigurationTransformer : public NCommon::TProviderConfigurationTransformer {

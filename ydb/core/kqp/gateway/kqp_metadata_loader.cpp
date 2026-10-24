@@ -114,14 +114,11 @@ TFuture<TResult> SendActorRequest(TActorSystem* actorSystem, const TActorId& act
 {
     auto promise = NewPromise<TResult>();
     auto span = MakeMetadataTraceSpan(traceId, actorSystem, operation, table, purpose);
-    span.Attribute("ydb.compile.kind", TString("async"));
     auto requestTraceId = span.GetTraceId();
     if (emittedSpan) {
         *emittedSpan = NWilson::TTraceId(requestTraceId);
     }
-    if (followsFrom) {
-        span.Link(followsFrom, {{"ydb.compile.relation", TString("follows_from")}});
-    }
+    LinkFollowsFrom(span, followsFrom);
     // Release the consumer only after recording completion, including when
     // the request finishes before its consumer attaches a callback.
     auto future = TraceCompileDependencyWith(promise.GetFuture(), std::move(span),

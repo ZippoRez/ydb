@@ -2,33 +2,11 @@
 
 #include <ydb/library/actors/core/actorsystem.h>
 
-#include <util/system/datetime.h>
 #include <util/system/guard.h>
 
 #include <algorithm>
 
 namespace NKikimr::NKqp {
-
-TCompileTraceContinuation::TCompileTraceContinuation(NWilson::TSpan span)
-    : Id(span.GetTraceId())
-    , Span(std::move(span))
-{}
-
-NWilson::TTraceId TCompileTraceContinuation::Complete(bool success) {
-    auto guard = Guard(Lock);
-    if (!Span) {
-        return {};
-    }
-    TCompileTrace::EndSpan(Span, success);
-    return NWilson::TTraceId(Id);
-}
-
-void TCompileTraceContinuation::Cancel() {
-    auto guard = Guard(Lock);
-    if (Span) {
-        Span.EndError("Compilation stopped before continuation was ready");
-    }
-}
 
 TCompileTrace::TCompileTrace(NWilson::TTraceId root, NActors::TActorSystem* actorSystem)
     : Root(std::move(root))
@@ -51,7 +29,7 @@ NWilson::TSpan TCompileTrace::StartSpan(ui8 verbosity, TString name) const {
     if (!IsEnabled(verbosity)) {
         return {};
     }
-    return NWilson::TSpan(verbosity, GetCurrentParent(), std::move(name), NWilson::EFlags::WALL_CLOCK, ActorSystem);
+    return NWilson::TSpan(verbosity, GetCurrentParent(), std::move(name), NWilson::EFlags::NONE, ActorSystem);
 }
 
 void TCompileTrace::EndSpan(NWilson::TSpan& span, bool success) {
@@ -83,7 +61,7 @@ void TCompileTrace::Push(const NWilson::TTraceId& id) {
 }
 
 bool TCompileTrace::Pop(const NWilson::TTraceId& id) {
-    // Phases stay open across asynchronous waits, so the span is not
+    // Regions stay open across asynchronous waits, so the span is not
     // necessarily the innermost one.
     auto guard = Guard(ParentsLock);
     const auto it = std::find_if(Parents.rbegin(), Parents.rend(), [&](const TParent& parent) {
@@ -95,55 +73,6 @@ bool TCompileTrace::Pop(const NWilson::TTraceId& id) {
         return hasChildren;
     }
     return false;
-}
-
-void TCompileTrace::AwaitDependency(const NWilson::TTraceId& dependency) {
-    if (!Finished && dependency && IsEnabled(TCompileTraceLevels::Step)
-        && std::find(AwaitedDependencies.begin(), AwaitedDependencies.end(), dependency) == AwaitedDependencies.end()) {
-        AwaitedDependencies.emplace_back(dependency);
-    }
-}
-
-std::shared_ptr<TCompileTraceContinuation> TCompileTrace::StartContinuation() {
-    if (Finished || !IsEnabled(TCompileTraceLevels::Step)) {
-        return {};
-    }
-    auto span = StartSpan(TCompileTraceLevels::Step, "Compiler continuation");
-    if (!span) {
-        AwaitedDependencies.clear();
-        return {};
-    }
-    span.Attribute("ydb.compile.kind", TString("async"));
-    for (const auto& dependency : AwaitedDependencies) {
-        span.Link(dependency, {{"ydb.compile.relation", TString("depends_on")}});
-    }
-    AwaitedDependencies.clear();
-    if (Continuation) {
-        Continuation->Cancel();
-    }
-    Continuation = std::make_shared<TCompileTraceContinuation>(std::move(span));
-    return Continuation;
-}
-
-void TCompileTrace::Resume(const NWilson::TTraceId& readyFrom) {
-    if (Finished) {
-        return;
-    }
-    if (Running++ == 0 && IsEnabled(TCompileTraceLevels::Step)) {
-        // A running turn must not become the parent of phases spanning waits.
-        ExecutionSpan = NWilson::TSpan(TCompileTraceLevels::Step, NWilson::TTraceId(Root),
-            "Compiler execution", NWilson::EFlags::WALL_CLOCK, ActorSystem);
-        ExecutionSpan.Attribute("ydb.compile.kind", TString("execution"));
-        if (readyFrom) {
-            ExecutionSpan.Link(readyFrom, {{"ydb.compile.relation", TString("follows_from")}});
-        }
-    }
-}
-
-void TCompileTrace::Suspend() {
-    if (Running && --Running == 0) {
-        ExecutionSpan.EndOk();
-    }
 }
 
 void FinishCompileDependency(NWilson::TSpan& span, bool futureSuccess, bool operationSuccess) {
@@ -177,10 +106,10 @@ void TCompileTrace::BeginRegion(ui8 verbosity, const TString& name, const void* 
     Regions.push_back({name, group, std::move(span)});
 }
 
-void TCompileTrace::EndRegion(TStringBuf name) {
+void TCompileTrace::EndRegion(TStringBuf name, const void* group, bool success) {
     for (size_t i = Regions.size(); i > 0; --i) {
-        if (Regions[i - 1].Name == name) {
-            EndRegions(Regions.size() - i + 1, true);
+        if (Regions[i - 1].Group == group && Regions[i - 1].Name == name) {
+            EndRegions(Regions.size() - i + 1, success);
             return;
         }
     }
@@ -197,16 +126,7 @@ void TCompileTrace::EndRegions(size_t count, bool success) {
 
 void TCompileTrace::Finish(bool success) {
     if (!std::exchange(Finished, true)) {
-        AwaitedDependencies.clear();
-        if (Continuation) {
-            Continuation->Cancel();
-            Continuation.reset();
-        }
         EndRegions(Regions.size(), success);
-        if (Running) {
-            Running = 1;
-            Suspend();
-        }
     }
 }
 
@@ -228,20 +148,6 @@ TCompileTraceScope::~TCompileTraceScope() {
     TCompileTrace::EndSpan(Span, Success && std::uncaught_exceptions() == UncaughtExceptions);
 }
 
-TCompileTraceRunScope::TCompileTraceRunScope(TCompileTrace::TPtr trace, const NWilson::TTraceId& readyFrom)
-    : Trace(std::move(trace))
-{
-    if (Trace) {
-        Trace->Resume(readyFrom);
-    }
-}
-
-TCompileTraceRunScope::~TCompileTraceRunScope() {
-    if (Trace) {
-        Trace->Suspend();
-    }
-}
-
 TCompileTraceRuleScope::TCompileTraceRuleScope(TCompileTrace* trace, const TString& name)
     : Trace(trace && trace->IsEnabled(TCompileTraceLevels::Detail) ? trace : nullptr)
     , Name(name)
@@ -250,7 +156,8 @@ TCompileTraceRuleScope::TCompileTraceRuleScope(TCompileTrace* trace, const TStri
     if (Trace) {
         Parent = Trace->GetCurrentParent();
         Id = Parent.Span(TCompileTraceLevels::Detail);
-        Start = TInstant::Now();
+        // The span is emitted later: sample the clock of the spans around it.
+        StartUnixNano = NWilson::TSpan::NowUnixNano();
         Trace->Push(Id);
     }
 }
@@ -259,11 +166,11 @@ TCompileTraceRuleScope::~TCompileTraceRuleScope() {
     if (!Trace) {
         return;
     }
-    const auto end = TInstant::Now();
+    const auto endUnixNano = NWilson::TSpan::NowUnixNano();
     const bool hasChildren = Trace->Pop(Id);
     const bool success = std::uncaught_exceptions() == UncaughtExceptions;
     if (Applied || hasChildren || !success) {
-        auto span = NWilson::TSpan::ConstructTerminated(Parent, Id, Start, end,
+        auto span = NWilson::TSpan::ConstructTerminated(Parent, Id, StartUnixNano, endUnixNano,
             success ? NWilson::NTraceProto::Status::STATUS_CODE_OK : NWilson::NTraceProto::Status::STATUS_CODE_ERROR,
             "Rule: " + Name, Trace->ActorSystem);
         if (Trace->ActorSystem) {

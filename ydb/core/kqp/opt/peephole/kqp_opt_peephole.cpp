@@ -339,8 +339,7 @@ struct TKqpPeepholePipelineFinalConfigurator : IPipelineConfigurator {
         , Trace(trace)
     {}
 
-    void AfterCreate(TTransformationPipeline*) const override {
-    }
+    void AfterCreate(TTransformationPipeline*) const override {}
 
     void AfterTypeAnnotation(TTransformationPipeline* pipeline) const override {
         AddTracedPeepholeTransformer(pipeline,

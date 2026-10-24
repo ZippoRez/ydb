@@ -84,8 +84,9 @@ private:
     TKqpTempTablesState::TConstPtr TempTablesState;
     std::optional<TKqpFederatedQuerySetup> FederatedQuerySetup;
     NWilson::TTraceId TraceId;
-    // Snapshot the initiating compiler context once; callbacks must not pick up
-    // unrelated phases that happen to be active when a response arrives.
+    // Parents requests under the compilation span running when a load starts.
+    // Each load passes that parent down to its follow-up requests: they are sent
+    // from callbacks, when an unrelated compilation span may be running.
     TCompileTrace::TPtr CompileTrace;
 
     NWilson::TTraceId GetTraceParent() const {

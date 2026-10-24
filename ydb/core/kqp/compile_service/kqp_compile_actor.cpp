@@ -92,8 +92,7 @@ public:
         , SplitCtx(std::move(splitCtx))
         , SplitExpr(std::move(splitExpr))
         , UserRequestContext(userRequestContext)
-        , CompileParentTraceId(traceId)
-        , CompileActorSpan(TWilsonKqp::CompileActor, std::move(traceId), "Compile query", NWilson::EFlags::WALL_CLOCK)
+        , CompileActorSpan(TWilsonKqp::CompileActor, std::move(traceId), "Compile query")
         , TempTablesState(std::move(tempTablesState))
         , CollectFullDiagnostics(collectFullDiagnostics)
         , CompileAction(compileAction)
@@ -104,6 +103,8 @@ public:
     {
         Config = BuildConfiguration(tableServiceConfig);
         PerStatementResult = perStatementResult && Config->GetEnablePerStatementQueryExecution();
+        // The compile actor works concurrently with the compile service that started it.
+        MarkAsyncFlow(CompileActorSpan);
     }
 
     TKikimrConfiguration::TPtr BuildConfiguration(const TTableServiceConfig& tableServiceConfig) {
@@ -151,12 +152,6 @@ public:
     }
 
     void Bootstrap(const TActorContext& ctx) {
-        if (CompileAction == ECompileActorAction::COMPILE && CompileActorSpan
-            && CompileActorSpan.GetTraceId().GetVerbosity() >= TCompileTraceLevels::Step) {
-            CompileActorSpan.Attribute("ydb.compile.kind", TString("async"));
-            CompileActorSpan.Event("Compilation started");
-            CompileActorSpan.Link(CompileParentTraceId, {{"ydb.compile.relation", TString("dispatch")}});
-        }
         switch(CompileAction) {
             case ECompileActorAction::PARSE:
                 StartParsing(ctx);
@@ -176,26 +171,6 @@ public:
         }
 
         TBase::Die(ctx);
-    }
-
-    void PassAway() override {
-        // Keep Compile query open until its compiler-owned state is released.
-        // This runs on the actor's thread right after the reply, not when the
-        // executor deletes the actor (which may happen during shutdown).
-        // Die calls PassAway, so this covers both.
-        FinishCompileTrace(CompileStatus);
-        auto cleanup = CompileActorSpan.CreateChild(TCompileTraceLevels::Step, "Cleanup compiler");
-        cleanup.Attribute("ydb.compile.cleanup", true);
-        AsyncSplitResult.Drop();
-        AsyncCompileResult.Drop();
-        KqpHost.Drop();
-        Gateway.Drop();
-        SplitExpr.Reset();
-        SplitCtx.reset();
-        cleanup.EndOk();
-        EndQueryTraceSpan(CompileActorSpan, CompileStatus);
-
-        TBase::PassAway();
     }
 
 private:
@@ -257,15 +232,16 @@ private:
             {"success", GetYdbStatus(result)},
             {"issues", result.Issues().ToOneLineString()});
 
+        const auto status = GetYdbStatus(result);
         auto responseEv = MakeHolder<TEvKqp::TEvSplitResponse>(
-            GetYdbStatus(result), result.Issues(),
+            status, result.Issues(),
             QueryId, std::move(result.Exprs), std::move(result.World), std::move(result.Ctx));
+        // End the spans before the receiver can consume the result.
+        FinishCompileTrace(status);
+        EndQueryTraceSpan(CompileActorSpan, status);
         Send(Owner, responseEv.Release());
 
         Counters->ReportCompileFinish(DbCounters);
-
-        FinishCompileTrace(GetYdbStatus(result));
-        CompileStatus = GetYdbStatus(result);
 
         PassAway();
     }
@@ -358,7 +334,6 @@ private:
 
     void StartCompilationWithSettings(IKqpHost::TPrepareSettings& prepareSettings) {
         NCpuTime::TCpuTimer timer(CompileCpuTime);
-        TCompileTraceRunScope running(CompileTrace);
 
         switch (QueryId.Settings.QueryType) {
             case NKikimrKqp::QUERY_TYPE_SQL_DML:
@@ -398,25 +373,13 @@ private:
         TActorSystem* actorSystem = ctx.ActorSystem();
         TActorId selfId = ctx.SelfID;
 
-        TCompileTraceRunScope running(CompileTrace);
-        auto future = AsyncCompileResult->Continue();
-        auto continuation = CompileTrace ? CompileTrace->StartContinuation() : nullptr;
-        auto callback = [actorSystem, selfId, continuation](const TFuture<bool>& future) {
-            bool finished;
-            try {
-                finished = future.GetValue();
-            } catch (...) {
-                if (continuation) {
-                    continuation->Complete(false);
-                }
-                throw;
-            }
-            auto readyFrom = continuation ? continuation->Complete() : NWilson::TTraceId();
+        auto callback = [actorSystem, selfId](const TFuture<bool>& future) {
+            bool finished = future.GetValue();
             auto processEv = MakeHolder<TEvKqp::TEvContinueProcess>(0, finished);
-            actorSystem->Send(new IEventHandle(selfId, {}, processEv.Release(), 0, 0, nullptr, std::move(readyFrom)));
+            actorSystem->Send(selfId, processEv.Release());
         };
 
-        future.Apply(callback);
+        AsyncCompileResult->Continue().Apply(callback);
     }
 
     IKqpHost::TPrepareSettings PrepareCompilationSettings(const TActorContext &ctx) {
@@ -556,20 +519,17 @@ private:
         stats.FromCache = false;
         stats.DurationUs = (TInstant::Now() - StartTime).MicroSeconds();
         stats.CpuTimeUs = CompileCpuTime.MicroSeconds();
-        NWilson::TTraceId replyFrom;
-        if (CompileActorSpan && CompileActorSpan.GetTraceId().GetVerbosity() >= TCompileTraceLevels::Step) {
-            // Record before sending: the receiver can run before Send returns.
-            CompileActorSpan.Event("Compilation reply dispatched");
-            replyFrom = CompileActorSpan.GetTraceId();
-        }
-        Send(Owner, responseEv.Release(), 0, 0, std::move(replyFrom));
 
-        Counters->ReportCompileFinish(DbCounters);
-
+        // End the spans before the receiver can consume the result. The
+        // receiver links its span to this one: it waited for the result.
         CompileActorSpan.Attribute("ydb.actor.type", TString("TKqpCompileActor"));
         CompileActorSpan.Attribute("ydb.cpu_us", static_cast<i64>(CompileCpuTime.MicroSeconds()));
         FinishCompileTrace(KqpCompileResult->Status);
-        CompileStatus = KqpCompileResult->Status;
+        auto compileSpanId = CompileActorSpan.GetTraceId();
+        EndQueryTraceSpan(CompileActorSpan, KqpCompileResult->Status);
+        Send(Owner, responseEv.Release(), 0, 0, std::move(compileSpanId));
+
+        Counters->ReportCompileFinish(DbCounters);
 
         PassAway();
     }
@@ -637,12 +597,12 @@ private:
             {"size", astStatements.size()});
 
         auto responseEv = MakeHolder<TEvKqp::TEvParseResponse>(QueryId, std::move(astStatements));
+        // End the spans before the receiver can consume the result.
+        FinishCompileTrace(Ydb::StatusIds::SUCCESS);
+        EndQueryTraceSpan(CompileActorSpan, Ydb::StatusIds::SUCCESS);
         Send(Owner, responseEv.Release());
 
         Counters->ReportCompileFinish(DbCounters);
-
-        FinishCompileTrace(Ydb::StatusIds::SUCCESS);
-        CompileStatus = Ydb::StatusIds::SUCCESS;
 
         PassAway();
     }
@@ -659,7 +619,6 @@ private:
 
     void HandleCompile(TEvKqp::TEvContinueProcess::TPtr &ev, const TActorContext &ctx) {
         Y_ENSURE(!ev->Get()->QueryId);
-        TCompileTraceRunScope running(CompileTrace, ev->TraceId);
 
         TYqlLogScope logScope(ctx, NKikimrServices::KQP_YQL, YqlName, UserRequestContext->TraceId);
 
@@ -860,9 +819,7 @@ private:
     std::optional<TString> ReplayMessageUserView;  // here metadata is part of json - full readable json for diagnostics
 
     TIntrusivePtr<TUserRequestContext> UserRequestContext;
-    const NWilson::TTraceId CompileParentTraceId;
     NWilson::TSpan CompileActorSpan;
-    Ydb::StatusIds::StatusCode CompileStatus = Ydb::StatusIds::ABORTED;
     TCompileTrace::TPtr CompileTrace;
 
     TKqpTempTablesState::TConstPtr TempTablesState;
