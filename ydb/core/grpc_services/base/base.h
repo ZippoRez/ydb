@@ -513,9 +513,9 @@ public:
     // validation
     virtual bool Validate(TString& error) = 0;
 
-    void InitializePathNormalization(std::shared_ptr<const NPathAliasing::TPathNormalizer> normalizer);
-    void InitializePathAliasCounter(NMonitoring::TDynamicCounterPtr counters,
-        const NKikimrScheme::TEvDescribeSchemeResult& database);
+    void InitializePathNormalization(std::shared_ptr<const NPathAliasing::TPathNormalizer> normalizer,
+        NMonitoring::TDynamicCounterPtr counters = {},
+        const NKikimrScheme::TEvDescribeSchemeResult* database = nullptr);
 
     const TMaybe<TString> GetDatabaseName() const final {
         return PathNormalizationInitialized_ ? EffectiveDatabaseName_ : GetDatabaseNameFromRequest();

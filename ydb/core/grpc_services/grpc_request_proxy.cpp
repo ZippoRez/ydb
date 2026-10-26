@@ -160,8 +160,8 @@ private:
             auto databaseIt = Databases.find(aliasDatabase && !aliasDatabase->empty()
                 ? CanonizePath(*aliasDatabase) : RootDatabase);
             if (databaseIt != Databases.end() && databaseIt->second.IsDatabaseReady()) {
-                requestBaseCtx->InitializePathAliasCounter(AppData(ctx)->Counters,
-                    databaseIt->second.SchemeBoardResult->DescribeSchemeResult);
+                requestBaseCtx->InitializePathNormalization({}, AppData(ctx)->Counters,
+                    &databaseIt->second.SchemeBoardResult->DescribeSchemeResult);
             }
         }
 

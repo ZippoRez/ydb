@@ -31,6 +31,11 @@ namespace NKikimr::NGRpcService {
             return database;
         }
 
+        void InitializeCounter(IRequestProxyCtx& request, NMonitoring::TDynamicCounterPtr counters,
+            const NKikimrScheme::TEvDescribeSchemeResult& database) {
+            request.InitializePathNormalization({}, std::move(counters), &database);
+        }
+
         class TNamedRequest : public TEvHttpRequestAuthAndCheck {
         public:
             explicit TNamedRequest(TString method, TString database = "/raw")
@@ -68,22 +73,23 @@ namespace NKikimr::NGRpcService {
     Y_UNIT_TEST_SUITE(PathAliasingRequestContext) {
         Y_UNIT_TEST(DatabaseAndResourceAliasesCountOncePerRequest) {
             NMonitoring::TDynamicCounterPtr root = new NMonitoring::TDynamicCounters;
+            auto normalizer = MakeNormalizer();
             for (ui64 count = 1; count <= 2; ++count) {
                 TNamedRequest request("Ydb.Topic.V1.TopicService/CreateTopic");
                 request.EnablePathNormalization();
-                request.InitializePathNormalization(MakeNormalizer());
+                request.InitializePathNormalization(normalizer);
                 auto unavailable = MakeDatabase("/rewritten");
                 unavailable.SetStatus(NKikimrScheme::StatusPathDoesNotExist);
-                request.InitializePathAliasCounter(root, unavailable);
+                InitializeCounter(request, root, unavailable);
                 UNIT_ASSERT_VALUES_EQUAL(GetPathAliasCount(root, "Ydb.Topic.V1.TopicService", "CreateTopic"), count - 1);
-                request.InitializePathAliasCounter(root, MakeDatabase("/rewritten"));
+                InitializeCounter(request, root, MakeDatabase("/rewritten"));
                 UNIT_ASSERT_VALUES_EQUAL(GetPathAliasCount(root, "Ydb.Topic.V1.TopicService", "CreateTopic"), count);
 
                 UNIT_ASSERT_VALUES_EQUAL(request.NormalizePath("/raw/a"), "/rewritten/a");
                 UNIT_ASSERT_VALUES_EQUAL(request.NormalizePath("/raw/b"), "/rewritten/b");
                 request.UseDatabase("/resolved");
-                request.InitializePathNormalization(MakeNormalizer());
-                request.InitializePathAliasCounter(root, MakeDatabase("/rewritten"));
+                request.InitializePathNormalization(normalizer);
+                InitializeCounter(request, root, MakeDatabase("/rewritten"));
                 UNIT_ASSERT_VALUES_EQUAL(GetPathAliasCount(root, "Ydb.Topic.V1.TopicService", "CreateTopic"), count);
             }
         }
@@ -101,7 +107,7 @@ namespace NKikimr::NGRpcService {
                 TNamedRequest request("Ydb.Topic.V1.TopicService/CreateTopic", database);
                 request.EnablePathNormalization();
                 request.InitializePathNormalization(normalizer);
-                request.InitializePathAliasCounter(root, MakeDatabase("/rewritten"));
+                InitializeCounter(request, root, MakeDatabase("/rewritten"));
                 UNIT_ASSERT_VALUES_EQUAL(request.GetDatabaseName().GetOrElse(""), "/rewritten");
             }
             UNIT_ASSERT_VALUES_EQUAL(GetPathAliasCount(root, "Ydb.Topic.V1.TopicService", "CreateTopic", "/first"), 1);
@@ -123,7 +129,7 @@ namespace NKikimr::NGRpcService {
                 TNamedRequest request(TString(service) + "/" + method, "/physical");
                 request.EnablePathNormalization();
                 request.InitializePathNormalization(MakeNormalizer());
-                request.InitializePathAliasCounter(root, MakeDatabase("/physical"));
+                InitializeCounter(request, root, MakeDatabase("/physical"));
                 UNIT_ASSERT_VALUES_EQUAL(request.NormalizePath("/physical/a"), "/physical/a");
                 UNIT_ASSERT_VALUES_EQUAL(request.NormalizePath("//physical/a"), "//physical/a");
                 UNIT_ASSERT_VALUES_EQUAL(GetPathAliasCount(root, service, method, "/physical"), 0);
@@ -141,19 +147,19 @@ namespace NKikimr::NGRpcService {
             disabled.EnablePathNormalization();
             disabled.DisablePathNormalization();
             disabled.InitializePathNormalization(MakeNormalizer());
-            disabled.InitializePathAliasCounter(root, MakeDatabase("/rewritten"));
+            InitializeCounter(disabled, root, MakeDatabase("/rewritten"));
             UNIT_ASSERT_VALUES_EQUAL(disabled.NormalizePath("/raw/a"), "/raw/a");
 
             TNamedRequest empty("Ydb.Topic.V1.TopicService/CreateTopic");
             empty.EnablePathNormalization();
             empty.InitializePathNormalization(nullptr);
-            empty.InitializePathAliasCounter(root, MakeDatabase("/raw"));
+            InitializeCounter(empty, root, MakeDatabase("/raw"));
             UNIT_ASSERT_VALUES_EQUAL(empty.NormalizePath("/raw/a"), "/raw/a");
 
             TNamedRequest legacy("Ydb.PersQueue.V1.PersQueueService/CreateTopic");
             legacy.EnablePathNormalization();
             legacy.InitializePathNormalization(MakeNormalizer());
-            legacy.InitializePathAliasCounter(root, MakeDatabase("/raw"));
+            InitializeCounter(legacy, root, MakeDatabase("/raw"));
             UNIT_ASSERT_VALUES_EQUAL(legacy.NormalizePath("/raw/a"), "/raw/a");
             UNIT_ASSERT_VALUES_EQUAL(GetPathAliasCount(root, "Ydb.Topic.V1.TopicService", "CreateTopic"), 0);
             UNIT_ASSERT_VALUES_EQUAL(GetPathAliasCount(root, "Ydb.PersQueue.V1.PersQueueService", "CreateTopic"), 0);
@@ -167,10 +173,10 @@ namespace NKikimr::NGRpcService {
                     TStringBuilder() << (i % 2 ? "/raw/" : "/unknown/") << i);
                 request.EnablePathNormalization();
                 request.InitializePathNormalization(MakeNormalizer());
-                request.InitializePathAliasCounter(root, MakeDatabase("/rewritten"));
+                InitializeCounter(request, root, MakeDatabase("/rewritten"));
                 auto table = MakeDatabase(TStringBuilder() << "/rewritten/" << i);
                 table.MutablePathDescription()->MutableSelf()->SetPathType(NKikimrSchemeOp::EPathTypeTable);
-                request.InitializePathAliasCounter(root, table);
+                InitializeCounter(request, root, table);
             }
             UNIT_ASSERT(!root->FindSubgroup("counters", "ydb"));
         }
@@ -184,7 +190,7 @@ namespace NKikimr::NGRpcService {
                 request.InitializePathNormalization(MakeNormalizer());
                 UNIT_ASSERT_VALUES_EQUAL(request.NormalizePath("/raw/a"), "/rewritten/a");
                 UNIT_ASSERT_VALUES_EQUAL(GetPathAliasCount(root, "Ydb.Scheme.V1.SchemeService", "DescribePath", "/physical"), count);
-                request.InitializePathAliasCounter(root, MakeDatabase("/physical"));
+                InitializeCounter(request, root, MakeDatabase("/physical"));
                 UNIT_ASSERT_VALUES_EQUAL(request.NormalizePath("/raw/b"), "/rewritten/b");
                 UNIT_ASSERT_VALUES_EQUAL(GetPathAliasCount(root, "Ydb.Scheme.V1.SchemeService", "DescribePath", "/physical"), ++count);
             }
@@ -207,11 +213,11 @@ namespace NKikimr::NGRpcService {
                 NMonitoring::TDynamicCounterPtr root = new NMonitoring::TDynamicCounters;
                 request.EnablePathNormalization();
                 request.InitializePathNormalization(MakeNormalizer());
-                request.InitializePathAliasCounter(root, MakeDatabase("/Root"));
+                InitializeCounter(request, root, MakeDatabase("/Root"));
                 UNIT_ASSERT_VALUES_EQUAL(request.NormalizePath("/raw"), "/rewritten");
                 UNIT_ASSERT_VALUES_EQUAL(request.NormalizePath("/raw/a"), "/rewritten/a");
                 request.InitializePathNormalization(MakeNormalizer());
-                request.InitializePathAliasCounter(root, MakeDatabase("/Root"));
+                InitializeCounter(request, root, MakeDatabase("/Root"));
                 UNIT_ASSERT_VALUES_EQUAL(GetPathAliasCount(root, "Ydb.Discovery.V1.DiscoveryService", "ListEndpoints", ""), 1);
             };
             TNamedRequest missing("Ydb.Discovery.V1.DiscoveryService/ListEndpoints", "");
@@ -224,7 +230,7 @@ namespace NKikimr::NGRpcService {
             NMonitoring::TDynamicCounterPtr root = new NMonitoring::TDynamicCounters;
             auto request = MakeRequest();
             request->InitializePathNormalization(MakeNormalizer());
-            request->InitializePathAliasCounter(root, MakeDatabase("/raw"));
+            InitializeCounter(*request, root, MakeDatabase("/raw"));
             UNIT_ASSERT_VALUES_EQUAL(request->NormalizePath("/raw"), "/raw");
 
             UNIT_ASSERT(!root->FindSubgroup("counters", "ydb"));

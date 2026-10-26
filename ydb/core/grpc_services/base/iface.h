@@ -1,9 +1,8 @@
 #pragma once
 
+#include <ydb/core/path_aliasing/path_normalizer.h>
 #include <util/generic/fwd.h>
 #include <ydb/library/actors/wilson/wilson_span.h>
-
-#include <library/cpp/monlib/dynamic_counters/counters.h>
 
 #include <memory>
 
@@ -18,10 +17,6 @@ class TUserToken;
 }
 namespace NKikimr {
 
-namespace NPathAliasing {
-class TPathNormalizer;
-}
-
 namespace NRpcService {
 struct  TRlPath;
 
@@ -33,6 +28,7 @@ using TAuditLogParts = TVector<std::pair<TString, TString>>;
 using TAuditLogHook = std::function<void (ui32 status, const TAuditLogParts&)>;
 
 class IRequestCtxBaseMtSafe {
+    friend class IRequestProxyCtx;
 public:
     void EnablePathNormalization() noexcept;
     void DisablePathNormalization() noexcept;
@@ -65,21 +61,10 @@ public:
     // Return deadile of request execution, calculated from client timeout by grpc
     virtual TInstant GetDeadline() const = 0;
 
-protected:
-    bool IsPathNormalizationEnabled() const noexcept;
-    bool CanInitializePathAliasCounter() const noexcept;
-    void SetPathNormalizer(std::shared_ptr<const NPathAliasing::TPathNormalizer> normalizer) noexcept;
-    void SetPathAliasCounter(NMonitoring::TDynamicCounters::TCounterPtr counter);
-
 private:
-    void RecordPathAliasUsage(bool used) const;
-
     std::shared_ptr<const NPathAliasing::TPathNormalizer> PathNormalizer_;
-    NMonitoring::TDynamicCounters::TCounterPtr PathAliasCounter_;
+    mutable NPathAliasing::TPathNormalizer::TRequestCounter PathAliasCounter_;
     bool PathNormalizationEnabled_ = false;
-    // Updated by the proxy before dispatch, then only by the owning RPC actor.
-    mutable bool PathAliasUsed_ = false;
-    mutable bool PathAliasCounted_ = false;
 };
 
 

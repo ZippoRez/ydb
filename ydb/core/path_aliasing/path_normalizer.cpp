@@ -1,5 +1,6 @@
 #include "path_normalizer.h"
 
+#include <ydb/core/base/counters.h>
 #include <ydb/core/base/path.h>
 #include <ydb/core/protos/config.pb.h>
 
@@ -64,7 +65,22 @@ namespace NKikimr::NPathAliasing {
         Impl = std::move(impl);
     }
 
-    TString TPathNormalizer::NormalizePath(TStringBuf path) const {
+    void TPathNormalizer::TRequestCounter::Initialize(
+        NMonitoring::TDynamicCounterPtr counters, TStringBuf rpcMethod, const TString& database) {
+        if (Counter || !counters) {
+            return;
+        }
+        Counter = GetServiceCounters(std::move(counters), "ydb")
+            ->GetSubgroup("api_service", TString(rpcMethod.Before('/')))
+            ->GetSubgroup("method", TString(rpcMethod.After('/')))
+            ->GetSubgroup("database", CanonizePath(database))
+            ->GetNamedCounter("name", "api.grpc.request.path_alias_count", true);
+        if (Used) {
+            Counter->Inc();
+        }
+    }
+
+    TString TPathNormalizer::NormalizePath(TStringBuf path, TRequestCounter* requestCounter) const {
         if (!Impl || !path.StartsWith("/")) {
             return TString(path);
         }
@@ -93,6 +109,12 @@ namespace NKikimr::NPathAliasing {
                     --write;
                 }
                 result.resize(write);
+                if (requestCounter && !requestCounter->Used) {
+                    requestCounter->Used = true;
+                    if (requestCounter->Counter) {
+                        requestCounter->Counter->Inc();
+                    }
+                }
                 return result;
             }
         }
