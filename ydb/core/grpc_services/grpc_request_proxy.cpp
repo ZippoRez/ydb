@@ -154,11 +154,14 @@ private:
 
         MaybeStartTracing(event);
 
+        TString databaseName;
+        auto databaseIt = Databases.end();
         // Counter labels require schema confirmation, unavailable with SkipSchemeCheck.
-        if (AppData(ctx)->PathNormalizer) {
+        if (requestBaseCtx->PathNormalizer_ && AppData(ctx)->Counters
+            && !requestBaseCtx->PathAliasCounter_.IsInitialized()) {
             const auto aliasDatabase = requestBaseCtx->GetDatabaseName();
-            auto databaseIt = Databases.find(aliasDatabase && !aliasDatabase->empty()
-                ? CanonizePath(*aliasDatabase) : RootDatabase);
+            databaseName = aliasDatabase && !aliasDatabase->empty() ? CanonizePath(*aliasDatabase) : RootDatabase;
+            databaseIt = Databases.find(databaseName);
             if (databaseIt != Databases.end() && databaseIt->second.IsDatabaseReady()) {
                 requestBaseCtx->InitializePathNormalization({}, AppData(ctx)->Counters,
                     &databaseIt->second.SchemeBoardResult->DescribeSchemeResult);
@@ -186,7 +189,6 @@ private:
             return;
         }
 
-        TString databaseName;
         const TDatabaseInfo* database = nullptr;
         bool skipResourceCheck = false;
         // do not check connect rights for the deprecated requests without database
@@ -202,9 +204,7 @@ private:
                 return;
             }
             const auto& maybeDatabaseName = requestBaseCtx->GetDatabaseName();
-            if (maybeDatabaseName && !maybeDatabaseName.GetRef().empty()) {
-                databaseName = CanonizePath(maybeDatabaseName.GetRef());
-            } else {
+            if (!maybeDatabaseName || maybeDatabaseName.GetRef().empty()) {
                 if (!std::is_same_v<TEvent, TEvHttpRequestAuthAndCheck>) { // TEvHttpRequestAuthAndCheck is allowed to be processed without database
                     Counters->IncEmptyDatabaseNameCounter();
                     if (!AllowYdbRequestsWithoutDatabase &&
@@ -219,20 +219,23 @@ private:
                     }
                 }
 
-                databaseName = RootDatabase;
                 skipResourceCheck = true;
                 skipCheckConnectRights = true;
             }
             if (databaseName.empty()) {
-                Counters->IncDatabaseUnavailableCounter();
-                const auto issue = MakeIssue(NKikimrIssues::TIssuesIds::GENERIC_TXPROXY_ERROR, "Empty database name");
-                requestBaseCtx->RaiseIssue(issue);
-                requestBaseCtx->ReplyWithYdbStatus(Ydb::StatusIds::BAD_REQUEST);
-                return;
+                databaseName = maybeDatabaseName && !maybeDatabaseName->empty()
+                    ? CanonizePath(*maybeDatabaseName) : RootDatabase;
+                if (databaseName.empty()) {
+                    Counters->IncDatabaseUnavailableCounter();
+                    const auto issue = MakeIssue(NKikimrIssues::TIssuesIds::GENERIC_TXPROXY_ERROR, "Empty database name");
+                    requestBaseCtx->RaiseIssue(issue);
+                    requestBaseCtx->ReplyWithYdbStatus(Ydb::StatusIds::BAD_REQUEST);
+                    return;
+                }
+                databaseIt = Databases.find(databaseName);
             }
-            auto it = Databases.find(databaseName);
-            if (it != Databases.end() && it->second.IsDatabaseReady()) {
-                database = &it->second;
+            if (databaseIt != Databases.end() && databaseIt->second.IsDatabaseReady()) {
+                database = &databaseIt->second;
             } else {
                 // No given database found, start update if possible
                 if (!DeferAndStartUpdate(databaseName, event, requestBaseCtx)) {

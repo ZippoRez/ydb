@@ -18,6 +18,7 @@ namespace NKikimr::NPathAliasing {
         // Owned by one request, accessed by its actors sequentially.
         class TRequestCounter {
         public:
+            bool IsInitialized() const noexcept { return bool(Counter); }
             void Initialize(NMonitoring::TDynamicCounterPtr counters, TStringBuf rpcMethod, const TString& database);
 
         private:

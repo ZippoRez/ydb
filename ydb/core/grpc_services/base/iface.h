@@ -29,6 +29,7 @@ using TAuditLogHook = std::function<void (ui32 status, const TAuditLogParts&)>;
 
 class IRequestCtxBaseMtSafe {
     friend class IRequestProxyCtx;
+    friend class TGRpcRequestProxyImpl;
 public:
     void EnablePathNormalization() noexcept;
     void DisablePathNormalization() noexcept;

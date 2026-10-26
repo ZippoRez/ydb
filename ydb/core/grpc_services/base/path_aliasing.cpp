@@ -46,7 +46,7 @@ namespace NKikimr::NGRpcService {
             PathNormalizationInitialized_ = true;
         }
 
-        if (!PathNormalizer_ || !database
+        if (!PathNormalizer_ || !counters || !database || PathAliasCounter_.IsInitialized()
             || database->GetStatus() != NKikimrScheme::StatusSuccess || !IsDatabase(*database)) {
             return;
         }

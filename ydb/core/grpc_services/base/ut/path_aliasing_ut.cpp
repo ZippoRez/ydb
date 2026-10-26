@@ -45,8 +45,16 @@ namespace NKikimr::NGRpcService {
             {}
 
             TString GetRpcMethodName() const override {
+                ++MetadataReads;
                 return Method_;
             }
+
+            const TMaybe<TString> GetDatabaseNameFromRequest() const override {
+                ++MetadataReads;
+                return TEvHttpRequestAuthAndCheck::GetDatabaseNameFromRequest();
+            }
+
+            mutable ui32 MetadataReads = 0;
 
         private:
             TString Method_;
@@ -82,14 +90,19 @@ namespace NKikimr::NGRpcService {
                 auto unavailable = MakeDatabase("/rewritten");
                 unavailable.SetStatus(NKikimrScheme::StatusPathDoesNotExist);
                 InitializeCounter(request, root, unavailable);
+                const auto unboundReads = request.MetadataReads;
+                InitializeCounter(request, {}, MakeDatabase("/rewritten"));
+                UNIT_ASSERT_VALUES_EQUAL(request.MetadataReads, unboundReads);
                 UNIT_ASSERT_VALUES_EQUAL(GetPathAliasCount(root), count);
                 InitializeCounter(request, root, MakeDatabase("/rewritten"));
                 UNIT_ASSERT_VALUES_EQUAL(GetPathAliasCount(root), ++count);
+                const auto boundReads = request.MetadataReads;
                 request.NormalizePath("/raw/a");
                 request.NormalizePath("/raw/b");
                 request.InitializePathNormalization(normalizer);
                 InitializeCounter(request, root, MakeDatabase("/rewritten"));
                 UNIT_ASSERT_VALUES_EQUAL(GetPathAliasCount(root), count);
+                UNIT_ASSERT_VALUES_EQUAL(request.MetadataReads, boundReads);
             }
         }
 
